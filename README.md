@@ -9,6 +9,7 @@ A Telegram bot that connects forum topics to Claude Code CLI sessions.
 - Claude responses stream back as Telegram messages
 - Tool calls displayed with 🔧 indicator
 - Typing indicator shown during processing
+- Edit diffs rendered as syntax-highlighted images
 
 ## Setup
 

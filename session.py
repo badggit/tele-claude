@@ -8,15 +8,17 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass, field
+from io import BytesIO
 from typing import Optional, Any
 
-from telegram import Bot, Message
+from telegram import Bot, Message, InputMediaPhoto
 from telegram.constants import ChatAction
 
 from claude_code_sdk import query, ClaudeCodeOptions
 
 from config import PROJECTS_DIR
 from logger import SessionLogger
+from diff_image import edit_to_image
 
 
 @dataclass
@@ -110,6 +112,9 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
     tool_buffer_name: Optional[str] = None  # Current tool type being buffered
     tool_buffer_msg: Optional[Message] = None  # Message being edited for batch
 
+    # Buffer for diff images to send as media group at end
+    diff_images: list[tuple[BytesIO, str]] = []  # [(image_buffer, filename), ...]
+
     def format_current_tool_buffer() -> str:
         """Format current tool buffer contents."""
         if len(tool_buffer) == 1:
@@ -202,6 +207,18 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                             tool_buffer_name = tool_name
                             await update_tool_buffer_message()
 
+                            # Buffer diff image for Edit tool
+                            if tool_name == "Edit" and "old_string" in tool_input and "new_string" in tool_input:
+                                file_path = tool_input.get("file_path", "file")
+                                img_buffer = edit_to_image(
+                                    file_path=file_path,
+                                    old_string=tool_input["old_string"],
+                                    new_string=tool_input["new_string"]
+                                )
+                                if img_buffer:
+                                    filename = file_path.split("/")[-1] if "/" in file_path else file_path
+                                    diff_images.append((img_buffer, filename))
+
                 elif isinstance(content, str) and content:
                     # Tool result - flush tool buffer first
                     await flush_tool_buffer()
@@ -230,6 +247,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
         await flush_tool_buffer()
         if response_text.strip() and response_msg is None:
             await send_message(session, bot, response_text)
+
+        # Send diff images as media group (gallery)
+        if diff_images:
+            await send_diff_images_gallery(session, bot, diff_images)
 
     except Exception as e:
         error_msg = f"❌ Error: {str(e)}"
@@ -343,6 +364,44 @@ async def send_typing_action(session: ClaudeSession, bot: Bot) -> None:
         session.last_typing_action = now
     except Exception:
         pass
+
+
+async def send_diff_images_gallery(
+    session: ClaudeSession,
+    bot: Bot,
+    images: list[tuple[BytesIO, str]]
+) -> None:
+    """Send diff images as a media group (gallery)."""
+    if not images:
+        return
+
+    try:
+        if len(images) == 1:
+            # Single image - send as photo with caption
+            img_buffer, filename = images[0]
+            await bot.send_photo(
+                chat_id=session.chat_id,
+                message_thread_id=session.thread_id,
+                photo=img_buffer,
+                caption=f"📝 {filename}"
+            )
+        else:
+            # Multiple images - send as media group
+            media = [
+                InputMediaPhoto(
+                    media=img_buffer,
+                    caption=f"📝 {filename}"
+                )
+                for img_buffer, filename in images
+            ]
+            await bot.send_media_group(
+                chat_id=session.chat_id,
+                message_thread_id=session.thread_id,
+                media=media
+            )
+    except Exception as e:
+        if session.logger:
+            session.logger.log_error("send_diff_images_gallery", e)
 
 
 def escape_html(text: str) -> str:
