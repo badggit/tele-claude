@@ -5,20 +5,86 @@ Manages conversations with Claude through the Code SDK,
 streaming responses to Telegram messages.
 """
 import asyncio
+import json
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
 from typing import Optional, Any
 
-from telegram import Bot, Message, InputMediaPhoto
+from telegram import Bot, Message, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 
 from claude_code_sdk import query, ClaudeCodeOptions
+from claude_code_sdk.types import (
+    ToolPermissionContext,
+    PermissionResult,
+    PermissionResultAllow,
+    PermissionResultDeny,
+)
 
 from config import PROJECTS_DIR
 from logger import SessionLogger
 from diff_image import edit_to_image
+
+
+# Tools that are always allowed without prompting
+DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"]
+
+# Persistent allowlist file
+ALLOWLIST_FILE = Path(__file__).parent / "tool_allowlist.json"
+
+# Pending permission requests: request_id -> asyncio.Future
+pending_permissions: dict[str, asyncio.Future] = {}
+
+
+def load_allowlist() -> set[str]:
+    """Load the persistent tool allowlist."""
+    if ALLOWLIST_FILE.exists():
+        try:
+            with open(ALLOWLIST_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def save_allowlist(tools: set[str]) -> None:
+    """Save the persistent tool allowlist."""
+    try:
+        with open(ALLOWLIST_FILE, "w") as f:
+            json.dump(list(tools), f)
+    except Exception:
+        pass
+
+
+def add_to_allowlist(tool_name: str) -> None:
+    """Add a tool to the persistent allowlist."""
+    tools = load_allowlist()
+    tools.add(tool_name)
+    save_allowlist(tools)
+
+
+def is_tool_allowed(tool_name: str) -> bool:
+    """Check if a tool is in the default or persistent allowlist."""
+    if tool_name in DEFAULT_ALLOWED_TOOLS:
+        return True
+    return tool_name in load_allowlist()
+
+
+async def resolve_permission(request_id: str, allowed: bool, always: bool = False, tool_name: str = None) -> bool:
+    """Resolve a pending permission request."""
+    future = pending_permissions.pop(request_id, None)
+    if future is None:
+        return False
+
+    if always and tool_name:
+        add_to_allowlist(tool_name)
+
+    future.set_result(allowed)
+    return True
 
 
 @dataclass
@@ -27,12 +93,102 @@ class ClaudeSession:
     chat_id: int
     thread_id: int
     cwd: str
+    bot: Optional[Bot] = None  # Reference for permission prompts
     logger: Optional[SessionLogger] = None
     last_send: float = field(default_factory=time.time)
     send_interval: float = 1.0
     last_typing_action: float = 0.0
     active: bool = True
     session_id: Optional[str] = None  # For multi-turn conversation
+
+
+async def request_tool_permission(
+    session: ClaudeSession,
+    tool_name: str,
+    tool_input: dict
+) -> bool:
+    """Send permission request to Telegram and wait for user response."""
+    if session.bot is None:
+        return False
+
+    # Generate unique request ID
+    request_id = str(uuid.uuid4())[:8]
+
+    # Format tool input for display
+    input_preview = []
+    for k, v in list(tool_input.items())[:3]:  # Show first 3 args
+        v_str = str(v)
+        if len(v_str) > 100:
+            v_str = v_str[:100] + "..."
+        v_str = escape_html(v_str)
+        input_preview.append(f"  <code>{k}</code>: {v_str}")
+    input_text = "\n".join(input_preview) if input_preview else "  (no arguments)"
+
+    # Build message with inline keyboard
+    message_text = (
+        f"🔐 <b>Permission Request</b>\n\n"
+        f"Tool: <code>{tool_name}</code>\n"
+        f"Arguments:\n{input_text}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Allow", callback_data=f"perm:allow:{request_id}:{tool_name}"),
+            InlineKeyboardButton("❌ Deny", callback_data=f"perm:deny:{request_id}:{tool_name}"),
+        ],
+        [
+            InlineKeyboardButton("✅ Always Allow", callback_data=f"perm:always:{request_id}:{tool_name}"),
+        ]
+    ])
+
+    # Send permission request message
+    await session.bot.send_message(
+        chat_id=session.chat_id,
+        message_thread_id=session.thread_id,
+        text=message_text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+    # Create future and wait for response
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    pending_permissions[request_id] = future
+
+    try:
+        # Wait for user response (timeout after 5 minutes)
+        allowed = await asyncio.wait_for(future, timeout=300.0)
+        return allowed
+    except asyncio.TimeoutError:
+        pending_permissions.pop(request_id, None)
+        await session.bot.send_message(
+            chat_id=session.chat_id,
+            message_thread_id=session.thread_id,
+            text="⏰ Permission request timed out (denied)"
+        )
+        return False
+
+
+def create_permission_handler(session: ClaudeSession):
+    """Create a can_use_tool callback for the given session."""
+    async def handle_permission(
+        tool_name: str,
+        tool_input: dict,
+        context: ToolPermissionContext
+    ) -> PermissionResult:
+        # Check if tool is in allowlist
+        if is_tool_allowed(tool_name):
+            return PermissionResultAllow()
+
+        # Request permission from user
+        allowed = await request_tool_permission(session, tool_name, tool_input)
+
+        if allowed:
+            return PermissionResultAllow()
+        else:
+            return PermissionResultDeny(message=f"User denied permission for {tool_name}")
+
+    return handle_permission
 
 
 # Active sessions: thread_id -> ClaudeSession
@@ -54,11 +210,12 @@ async def start_session(chat_id: int, thread_id: int, folder_name: str, bot: Bot
     # Create logger
     logger = SessionLogger(thread_id, chat_id, str(cwd))
 
-    # Store session
+    # Store session with bot reference
     sessions[thread_id] = ClaudeSession(
         chat_id=chat_id,
         thread_id=thread_id,
         cwd=str(cwd),
+        bot=bot,
         logger=logger
     )
 
@@ -151,9 +308,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
         tool_buffer_msg = None
 
     try:
-        # Configure options - include resume for multi-turn
+        # Configure options - use permission handler for interactive tool approval
         options = ClaudeCodeOptions(
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"],
+            allowed_tools=[],  # Empty - let can_use_tool handle all permissions
+            can_use_tool=create_permission_handler(session),
             permission_mode="acceptEdits",
             cwd=session.cwd,
             resume=session.session_id  # Resume previous conversation if exists

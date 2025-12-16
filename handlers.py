@@ -8,7 +8,7 @@ from telegram.ext import ContextTypes
 
 from config import GENERAL_TOPIC_ID
 from utils import get_project_folders
-from session import sessions, start_session, send_to_claude
+from session import sessions, start_session, send_to_claude, resolve_permission
 
 
 async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -137,6 +137,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     message_thread_id=thread_id,
                     text=f"Failed to start session: folder '{folder_name}' not found"
                 )
+            return
+
+    # Handle permission responses: "perm:<action>:<request_id>:<tool_name>"
+    if data.startswith("perm:"):
+        parts = data.split(":", 3)
+        if len(parts) == 4:
+            _, action, request_id, tool_name = parts
+
+            callback_message = query.message
+            if callback_message is None or not isinstance(callback_message, Message):
+                return
+
+            if action == "allow":
+                success = await resolve_permission(request_id, allowed=True, always=False, tool_name=tool_name)
+                if success:
+                    await callback_message.edit_text(
+                        f"✅ Allowed <code>{tool_name}</code> (one-time)",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await callback_message.edit_text("⚠️ Permission request expired")
+
+            elif action == "deny":
+                success = await resolve_permission(request_id, allowed=False, always=False, tool_name=tool_name)
+                if success:
+                    await callback_message.edit_text(
+                        f"❌ Denied <code>{tool_name}</code>",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await callback_message.edit_text("⚠️ Permission request expired")
+
+            elif action == "always":
+                success = await resolve_permission(request_id, allowed=True, always=True, tool_name=tool_name)
+                if success:
+                    await callback_message.edit_text(
+                        f"✅ Always allowed <code>{tool_name}</code>",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await callback_message.edit_text("⚠️ Permission request expired")
+
             return
 
     # Unknown callback - ignore
