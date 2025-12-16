@@ -24,6 +24,17 @@ from logger import SessionLogger
 from diff_image import edit_to_image
 
 
+# Context window sizes by model (tokens)
+MODEL_CONTEXT_WINDOWS = {
+    "claude-opus-4-5-20251101": 200000,
+    "claude-sonnet-4-5-20251101": 200000,
+    "claude-sonnet-4-20250514": 200000,
+    "default": 200000,
+}
+
+# Warn user when context remaining drops below this percentage
+CONTEXT_WARNING_THRESHOLD = 15
+
 # Tools that are always allowed without prompting
 DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task", "WebSearch"]
 
@@ -102,6 +113,7 @@ class ClaudeSession:
     active: bool = True
     session_id: Optional[str] = None  # For multi-turn conversation
     client: Optional[ClaudeSDKClient] = None  # Active SDK client for interrupt support
+    last_context_percent: Optional[float] = None  # Last known context remaining %
 
 
 async def interrupt_session(thread_id: int) -> bool:
@@ -247,6 +259,35 @@ MIN_SEND_INTERVAL = 1.0
 TYPING_ACTION_INTERVAL = 4.0
 
 
+def calculate_context_remaining(usage: dict, model: str = "default") -> Optional[float]:
+    """Calculate percentage of context window remaining from usage data.
+
+    Returns percentage remaining (0-100), or None if usage data insufficient.
+    """
+    if not usage:
+        return None
+
+    # Sum all token types that count toward context
+    total_tokens = (
+        usage.get("input_tokens", 0) +
+        usage.get("cache_read_input_tokens", 0) +
+        usage.get("cache_creation_input_tokens", 0) +
+        usage.get("output_tokens", 0)
+    )
+
+    if total_tokens == 0:
+        return None
+
+    # Get context window for model
+    context_window = MODEL_CONTEXT_WINDOWS.get(model, MODEL_CONTEXT_WINDOWS["default"])
+
+    # Calculate remaining percentage
+    used_percent = (total_tokens / context_window) * 100
+    remaining_percent = 100 - used_percent
+
+    return max(0, remaining_percent)
+
+
 async def start_session(chat_id: int, thread_id: int, folder_name: str, bot: Bot) -> bool:
     """Start a new Claude session for a Telegram thread."""
     cwd = PROJECTS_DIR / folder_name
@@ -309,6 +350,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
     # Track current response message for streaming edits
     response_msg: Optional[Message] = None
     response_text = ""
+    response_msg_text_len = 0  # Length of text in current response_msg
 
     # Buffer for batching consecutive tool calls of same type
     tool_buffer: list[tuple[str, dict]] = []  # [(tool_name, input), ...]
@@ -317,6 +359,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
 
     # Buffer for diff images to send as media group at end
     diff_images: list[tuple[BytesIO, str]] = []  # [(image_buffer, filename), ...]
+
+    # Track model and usage for context calculation
+    current_model: Optional[str] = None
+    last_usage: Optional[dict] = None
 
     def format_current_tool_buffer() -> str:
         """Format current tool buffer contents."""
@@ -405,18 +451,19 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                                 await flush_tool_buffer()
 
                                 response_text += block.text
-                                response_msg = await send_or_edit_response(
-                                    session, bot, response_msg, response_text
+                                response_msg, response_msg_text_len = await send_or_edit_response(
+                                    session, bot, response_msg, response_text, response_msg_text_len
                                 )
 
                             elif hasattr(block, 'name') and hasattr(block, 'input'):
                                 # Tool use block - buffer it
                                 if response_text.strip():
-                                    response_msg = await send_or_edit_response(
-                                        session, bot, response_msg, response_text
+                                    response_msg, response_msg_text_len = await send_or_edit_response(
+                                        session, bot, response_msg, response_text, response_msg_text_len
                                     )
                                     response_msg = None
                                     response_text = ""
+                                    response_msg_text_len = 0
 
                                 tool_name = block.name
                                 tool_input = block.input
@@ -459,12 +506,19 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                 if hasattr(message, 'session_id') and message.session_id:
                     session.session_id = message.session_id
 
-                # Log stats if available (but don't show to user - it's included in subscription)
-                if hasattr(message, 'cost_usd') or hasattr(message, 'total_cost_usd'):
-                    cost = getattr(message, 'total_cost_usd', None) or getattr(message, 'cost_usd', None)
+                # Capture model from AssistantMessage
+                if msg_type == "AssistantMessage" and hasattr(message, 'model'):
+                    current_model = message.model
+
+                # Capture usage from ResultMessage
+                if msg_type == "ResultMessage":
+                    if hasattr(message, 'usage') and message.usage:
+                        last_usage = message.usage
+                    # Log stats (but don't show cost to user - it's included in subscription)
+                    cost = getattr(message, 'total_cost_usd', None)
                     duration = getattr(message, 'duration_ms', 0)
                     if session.logger and cost is not None:
-                        session.logger.log_session_stats(cost, duration, {})
+                        session.logger.log_session_stats(cost, duration, last_usage or {})
 
             # Flush any remaining buffers (inside async with, after loop)
             await flush_tool_buffer()
@@ -474,6 +528,42 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             # Send diff images as media group (gallery)
             if diff_images:
                 await send_diff_images_gallery(session, bot, diff_images)
+
+            # Calculate and store context remaining
+            if last_usage:
+                context_remaining = calculate_context_remaining(last_usage, current_model or "default")
+                if context_remaining is not None:
+                    session.last_context_percent = context_remaining
+
+                    # Warn user if context is running low - append to last text response
+                    if context_remaining < CONTEXT_WARNING_THRESHOLD:
+                        if session.logger:
+                            session.logger._write_log(f"CONTEXT WARNING: {context_remaining:.1f}% remaining")
+
+                        warning = f"\n\n⚠️ {context_remaining:.0f}% context remaining"
+
+                        # Only append to text response message (not tool messages)
+                        if response_msg and response_msg_text_len > 0:
+                            # Check if warning fits in current message
+                            if response_msg_text_len + len(warning) <= 4000:
+                                # Get the text currently in the message and append warning
+                                # Use the portion of response_text that's in this message
+                                current_msg_text = response_text[-response_msg_text_len:] if len(response_text) > response_msg_text_len else response_text
+                                warning_text = current_msg_text + warning
+                                try:
+                                    html_text = markdown_to_html(warning_text)
+                                    await bot.edit_message_text(
+                                        chat_id=session.chat_id,
+                                        message_id=response_msg.message_id,
+                                        text=html_text,
+                                        parse_mode="HTML"
+                                    )
+                                except Exception:
+                                    # Edit failed, send as separate message
+                                    await send_message(session, bot, f"⚠️ {context_remaining:.0f}% context remaining")
+                            else:
+                                # Warning doesn't fit, send separately
+                                await send_message(session, bot, f"⚠️ {context_remaining:.0f}% context remaining")
 
             # Clear client reference when done
             session.client = None
@@ -502,18 +592,41 @@ async def send_or_edit_response(
     session: ClaudeSession,
     bot: Bot,
     existing_msg: Optional[Message],
-    text: str
-) -> Optional[Message]:
-    """Send a new response message or edit an existing one."""
-    if not text.strip():
-        return existing_msg
+    text: str,
+    msg_text_len: int = 0
+) -> tuple[Optional[Message], int]:
+    """Send a new response message or edit an existing one.
 
-    # Truncate if too long (before conversion to avoid cutting HTML tags)
-    if len(text) > 4000:
-        text = text[:3990] + "\n..."
+    Handles overflow by starting a new message when text exceeds 4000 chars.
+
+    Args:
+        session: The Claude session
+        bot: Telegram bot instance
+        existing_msg: Existing message to edit, or None to send new
+        text: Full accumulated text to display
+        msg_text_len: Length of text already in existing_msg (for overflow detection)
+
+    Returns:
+        Tuple of (current message, length of text in that message)
+    """
+    if not text.strip():
+        return existing_msg, msg_text_len
+
+    # Check if we need to overflow to a new message
+    if len(text) > 4000 and existing_msg and msg_text_len > 0:
+        # Current message is full, start a new one with overflow text
+        overflow_text = text[msg_text_len:]
+        new_msg = await send_message(session, bot, markdown_to_html(overflow_text), parse_mode="HTML")
+        return new_msg, len(overflow_text) if new_msg else msg_text_len
 
     # Convert markdown to HTML for Telegram
     html_text = markdown_to_html(text)
+
+    # Truncate HTML if still too long (safety net)
+    display_text = text
+    if len(display_text) > 4000:
+        display_text = display_text[:3990] + "\n..."
+        html_text = markdown_to_html(display_text)
 
     try:
         if existing_msg:
@@ -524,10 +637,11 @@ async def send_or_edit_response(
                 text=html_text,
                 parse_mode="HTML"
             )
-            return existing_msg
+            return existing_msg, len(display_text)
         else:
             # Send new message with rate limiting
-            return await send_message(session, bot, html_text, parse_mode="HTML")
+            new_msg = await send_message(session, bot, html_text, parse_mode="HTML")
+            return new_msg, len(display_text) if new_msg else 0
     except Exception as e:
         if session.logger and "message is not modified" not in str(e).lower():
             session.logger.log_error("send_or_edit_response", e)
@@ -538,14 +652,16 @@ async def send_or_edit_response(
                     await bot.edit_message_text(
                         chat_id=session.chat_id,
                         message_id=existing_msg.message_id,
-                        text=text
+                        text=display_text
                     )
+                    return existing_msg, len(display_text)
                 else:
-                    return await send_message(session, bot, text)
+                    new_msg = await send_message(session, bot, display_text)
+                    return new_msg, len(display_text) if new_msg else 0
             except Exception as fallback_err:
                 if session.logger:
                     session.logger.log_error("send_or_edit_response_fallback", fallback_err)
-        return existing_msg
+        return existing_msg, msg_text_len
 
 
 async def send_message(
