@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 from config import GENERAL_TOPIC_ID
 from utils import get_project_folders
-from session import sessions, start_session, send_to_claude, resolve_permission
+from session import sessions, start_session, send_to_claude, resolve_permission, interrupt_session
 
 
 async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -219,6 +219,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Check if this thread has an active Claude session
     if thread_id and thread_id in sessions:
+        # Interrupt any ongoing query first
+        was_interrupted = await interrupt_session(thread_id)
+        if was_interrupted:
+            # Small delay to let interrupt complete
+            await asyncio.sleep(0.1)
+
         # Run as background task - don't await!
         # Awaiting would block callback processing (deadlock for permission buttons)
         asyncio.create_task(send_to_claude(thread_id, text, context.bot))

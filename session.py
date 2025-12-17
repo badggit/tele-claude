@@ -101,6 +101,20 @@ class ClaudeSession:
     last_typing_action: float = 0.0
     active: bool = True
     session_id: Optional[str] = None  # For multi-turn conversation
+    client: Optional[ClaudeSDKClient] = None  # Active SDK client for interrupt support
+
+
+async def interrupt_session(thread_id: int) -> bool:
+    """Interrupt the active Claude response for a session.
+
+    Returns True if an active query was interrupted, False otherwise.
+    """
+    session = sessions.get(thread_id)
+    if not session or not session.client:
+        return False
+
+    await session.client.interrupt()
+    return True
 
 
 async def request_tool_permission(
@@ -365,6 +379,9 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             }
 
         async with ClaudeSDKClient(options=options) as client:
+            # Store client reference for interrupt support
+            session.client = client
+
             await client.query(prompt_stream())
             async for message in client.receive_response():
                 # Refresh typing indicator on each message
@@ -458,6 +475,9 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             if diff_images:
                 await send_diff_images_gallery(session, bot, diff_images)
 
+            # Clear client reference when done
+            session.client = None
+
     except ProcessError as e:
         # Log stderr from CLI process
         if session.logger:
@@ -473,6 +493,9 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
         await send_message(session, bot, error_msg)
         if session.logger:
             session.logger.log_error("send_to_claude", e)
+    finally:
+        # Always clear client reference
+        session.client = None
 
 
 async def send_or_edit_response(
