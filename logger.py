@@ -2,10 +2,16 @@
 Session debug logging for Telegram bot.
 
 Logs Claude Agent SDK events and Telegram messages for debugging.
+
+Two logging systems:
+1. Global app log (logs/app.log) - all non-session events, third-party lib logs
+2. Per-session logs (logs/session_*/session.log) - detailed session events
 """
 import json
+import logging
 import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
@@ -14,6 +20,60 @@ LOGS_DIR = Path(__file__).parent / "logs"
 
 # Content preview length
 PREVIEW_LENGTH = 60
+
+# Global app logger
+_app_logger: Optional[logging.Logger] = None
+
+
+def setup_logging() -> None:
+    """Configure logging: silent console, full file logging.
+
+    - All third-party libs (httpx, telegram, claude_agent_sdk) -> logs/app.log
+    - Session-specific events -> logs/session_*/session.log (via SessionLogger)
+    """
+    global _app_logger
+
+    LOGS_DIR.mkdir(exist_ok=True)
+
+    # Root logger config - capture everything but don't output to console
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+
+    # Remove any existing handlers (prevents console output)
+    root_logger.handlers.clear()
+
+    # File handler for all logs - rotating to prevent huge files
+    app_log_path = LOGS_DIR / "app.log"
+    file_handler = RotatingFileHandler(
+        app_log_path,
+        maxBytes=10 * 1024 * 1024,  # 10 MB
+        backupCount=5,
+        encoding="utf-8"
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    root_logger.addHandler(file_handler)
+
+    # App logger for our own code
+    _app_logger = logging.getLogger("tele-bot")
+    _app_logger.setLevel(logging.DEBUG)
+
+    # Log startup
+    _app_logger.info("="*60)
+    _app_logger.info("Bot starting up")
+    _app_logger.info("="*60)
+
+
+def get_app_logger() -> logging.Logger:
+    """Get the global app logger for non-session logging."""
+    global _app_logger
+    if _app_logger is None:
+        # Fallback if setup_logging() wasn't called
+        setup_logging()
+    return _app_logger  # type: ignore
 
 
 def _preview(text: str, length: int = PREVIEW_LENGTH) -> str:

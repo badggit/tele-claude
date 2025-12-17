@@ -6,6 +6,7 @@ streaming responses to Telegram messages.
 """
 import asyncio
 import json
+import logging
 import re
 import time
 import uuid
@@ -22,6 +23,9 @@ from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ProcessError, 
 from config import PROJECTS_DIR
 from logger import SessionLogger
 from diff_image import edit_to_image
+
+# Module logger (named _log to avoid collision with SessionLogger variables named 'logger')
+_log = logging.getLogger("tele-bot.session")
 
 
 # Context window sizes by model (tokens)
@@ -83,8 +87,7 @@ async def resolve_permission(request_id: str, allowed: bool, always: bool = Fals
     """Resolve a pending permission request."""
     entry = pending_permissions.pop(request_id, None)
     if entry is None:
-        # Log to stderr since we don't have a logger reference
-        print(f"[WARN] Permission future not found for request_id={request_id}, pending_keys={list(pending_permissions.keys())}")
+        _log.warning(f"Permission future not found for request_id={request_id}, pending_keys={list(pending_permissions.keys())}")
         return False
 
     future, logger = entry

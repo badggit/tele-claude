@@ -5,13 +5,10 @@ from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQu
 
 from config import BOT_TOKEN
 from handlers import handle_new_topic, handle_callback, handle_message, handle_topic_created
+from logger import setup_logging
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Configure logging - silent console, full file logging
+setup_logging()
 
 
 def main() -> None:

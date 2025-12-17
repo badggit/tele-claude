@@ -3,13 +3,15 @@ Telegram bot handlers for Claude Code bridge.
 
 Handles commands, callbacks, and message forwarding to Claude sessions.
 """
-import logging
 from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import ContextTypes
 
-logger = logging.getLogger(__name__)
+import logging
+
+# Use standard logging - logger.py's setup_logging() will configure the handlers
+logger = logging.getLogger("tele-bot.handlers")
 
 from config import GENERAL_TOPIC_ID
 from utils import get_project_folders
