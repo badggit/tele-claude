@@ -451,6 +451,17 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
         tool_buffer_msg = None
 
     try:
+        # Check if AGENTS.md exists for project context
+        agents_md_path = Path(session.cwd) / "AGENTS.md"
+        system_prompt = None
+        if agents_md_path.exists():
+            system_prompt = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": "IMPORTANT: This project has an AGENTS.md file in the root directory. "
+                          "Read it at the start of the session to understand project context and instructions."
+            }
+
         # Configure options - use permission handler for interactive tool approval
         options = ClaudeAgentOptions(
             allowed_tools=[],  # Empty - let can_use_tool handle all permissions
@@ -458,6 +469,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             permission_mode="acceptEdits",
             cwd=session.cwd,
             resume=session.session_id,  # Resume previous conversation if exists
+            system_prompt=system_prompt,
             hooks={
                 "PreCompact": [
                     HookMatcher(hooks=[create_pre_compact_hook(session)])
