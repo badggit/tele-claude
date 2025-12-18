@@ -26,6 +26,7 @@ from config import PROJECTS_DIR
 from logger import SessionLogger
 from diff_image import edit_to_image
 from commands import load_contextual_commands, register_commands_for_chat
+from mcp_tools import create_telegram_mcp_server
 
 # Module logger (named _log to avoid collision with SessionLogger variables named 'logger')
 _log = logging.getLogger("tele-claude.session")
@@ -43,7 +44,10 @@ MODEL_CONTEXT_WINDOWS = {
 CONTEXT_WARNING_THRESHOLD = 15
 
 # Tools that are always allowed without prompting
-DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task", "WebSearch"]
+DEFAULT_ALLOWED_TOOLS = [
+    "Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task", "WebSearch",
+    "mcp__telegram-tools__send_to_telegram",  # Custom tool for sending files to chat
+]
 
 # Persistent allowlist file
 ALLOWLIST_FILE = Path(__file__).parent / "tool_allowlist.json"
@@ -481,6 +485,9 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                            "Read it at the start of the session to understand project context and instructions."
                 )
 
+        # Create telegram MCP server bound to this session
+        telegram_mcp = create_telegram_mcp_server(session)
+
         # Configure options - use permission handler for interactive tool approval
         options = ClaudeAgentOptions(
             allowed_tools=[],  # Empty - let can_use_tool handle all permissions
@@ -489,6 +496,9 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             cwd=session.cwd,
             resume=session.session_id,  # Resume previous conversation if exists
             system_prompt=system_prompt,
+            mcp_servers={
+                "telegram-tools": telegram_mcp,
+            },
             hooks={
                 "PreCompact": [
                     HookMatcher(hooks=[create_pre_compact_hook(session)])
