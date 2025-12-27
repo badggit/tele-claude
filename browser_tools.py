@@ -1,8 +1,9 @@
 """
 Browser automation tools for Claude Agent SDK.
 
-Provides Playwright-based browser control with:
-- Persistent context for cookies/authentication
+Provides browser control with:
+- Fast CDP connection via cdp-browser library (only creates ONE new tab, doesn't touch existing tabs)
+- Persistent context for cookies/authentication via Playwright (non-CDP mode)
 - Accessibility tree extraction for element targeting
 - Screenshot capture for visual understanding
 """
@@ -10,9 +11,12 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
+# Import vendored cdp-browser library
+from vendor.cdp_browser import Browser as CDPBrowser, Page as CDPPage
+from vendor.cdp_browser.errors import ElementNotFoundError as CDPElementNotFoundError
+from playwright.async_api import async_playwright, Browser as PWBrowser, BrowserContext, Page as PWPage, Playwright
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -22,9 +26,11 @@ if TYPE_CHECKING:
 # Configuration (imported from config.py at runtime to avoid circular imports)
 ACCESSIBILITY_MAX_LENGTH = 50000  # Truncate if larger
 
-# Global playwright instance (reused across sessions)
+# Global instances (reused across sessions)
 _playwright: Optional[Playwright] = None
 _playwright_lock = asyncio.Lock()
+_cdp_browser: Optional[CDPBrowser] = None
+_cdp_browser_lock = asyncio.Lock()
 
 
 async def get_playwright() -> Playwright:
@@ -36,34 +42,63 @@ async def get_playwright() -> Playwright:
         return _playwright
 
 
+async def get_cdp_browser(endpoint: str) -> CDPBrowser:
+    """Get or create global CDP browser connection."""
+    global _cdp_browser
+    async with _cdp_browser_lock:
+        if _cdp_browser is None:
+            _cdp_browser = await CDPBrowser(endpoint).connect()
+        return _cdp_browser
+
+
 @dataclass
 class BrowserSession:
     """Manages browser state for a Claude session."""
-    context: BrowserContext
-    page: Page
+    # For CDP mode: uses cdp-browser
+    cdp_page: Optional[CDPPage] = None
+    # For non-CDP mode: uses Playwright
+    pw_context: Optional[BrowserContext] = None
+    pw_page: Optional[PWPage] = None
     user_data_dir: Optional[Path] = None
-    browser: Optional[Browser] = None  # Only set for CDP connections
     last_activity: float = field(default_factory=time.time)
-    is_cdp: bool = False  # True if connected via CDP
+
+    @property
+    def is_cdp(self) -> bool:
+        return self.cdp_page is not None
+
+    @property
+    def page(self) -> Union[CDPPage, PWPage]:
+        """Get the active page (either CDP or Playwright)."""
+        if self.cdp_page:
+            return self.cdp_page
+        if self.pw_page:
+            return self.pw_page
+        raise RuntimeError("No page available")
 
     def touch(self) -> None:
         """Update last activity timestamp."""
         self.last_activity = time.time()
 
     async def close(self) -> None:
-        """Close browser context (but not CDP browser - that's the user's Chrome)."""
+        """Close browser session."""
         try:
-            if self.is_cdp:
-                # For CDP, just close the page we created, not the whole browser
-                await self.page.close()
-            else:
-                await self.context.close()
+            if self.cdp_page:
+                await self.cdp_page.close()
+                self.cdp_page = None
+            if self.pw_context:
+                await self.pw_context.close()
+                self.pw_context = None
+                self.pw_page = None
         except Exception:
             pass
 
 
 async def create_browser_session(thread_id: int, headless: bool = True, data_dir: Optional[Path] = None) -> BrowserSession:
     """Create new browser session with persistent context or CDP connection.
+
+    For CDP mode: Uses cdp-browser library to create a SINGLE new tab in the
+    user's Chrome without attaching to or interfering with existing tabs.
+    This connects in <1 second regardless of how many tabs are open.
 
     Args:
         thread_id: Telegram thread ID for isolation
@@ -72,22 +107,15 @@ async def create_browser_session(thread_id: int, headless: bool = True, data_dir
     """
     from config import BROWSER_CDP_ENDPOINT, BROWSER_DATA_DIR, BROWSER_HEADLESS
 
+    if BROWSER_CDP_ENDPOINT:
+        # Use cdp-browser for fast CDP connection
+        browser = await get_cdp_browser(BROWSER_CDP_ENDPOINT)
+        page = await browser.new_page()
+        return BrowserSession(cdp_page=page)
+
+    # Otherwise launch our own browser with Playwright persistent context
     pw = await get_playwright()
 
-    # If CDP endpoint is configured, connect to existing Chrome
-    if BROWSER_CDP_ENDPOINT:
-        browser = await pw.chromium.connect_over_cdp(BROWSER_CDP_ENDPOINT)
-        context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        page = await context.new_page()
-
-        return BrowserSession(
-            context=context,
-            page=page,
-            browser=browser,
-            is_cdp=True
-        )
-
-    # Otherwise launch our own browser with persistent context
     if data_dir is None:
         data_dir = BROWSER_DATA_DIR
     if headless is None:
@@ -102,7 +130,6 @@ async def create_browser_session(thread_id: int, headless: bool = True, data_dir
         user_data_dir=str(user_data_dir),
         headless=headless,
         viewport={"width": 1280, "height": 720},
-        # Enable accessibility tree
         args=["--force-renderer-accessibility"]
     )
 
@@ -110,17 +137,39 @@ async def create_browser_session(thread_id: int, headless: bool = True, data_dir
     page = context.pages[0] if context.pages else await context.new_page()
 
     return BrowserSession(
-        context=context,
-        page=page,
+        pw_context=context,
+        pw_page=page,
         user_data_dir=user_data_dir
     )
 
 
 async def ensure_browser(session: "ClaudeSession") -> BrowserSession:
-    """Ensure browser session exists, creating if needed."""
+    """Ensure browser session exists and is healthy, creating/reconnecting if needed."""
     from config import BROWSER_HEADLESS
+
+    # Check if existing session is still alive
+    if session.browser_session is not None:
+        try:
+            # Quick health check - verify the page is responsive
+            bs = session.browser_session
+            if bs.is_cdp and bs.cdp_page:
+                # For CDP, check the page is still open
+                await bs.cdp_page.evaluate("1 + 1")
+            elif bs.pw_page:
+                # For Playwright, check context is alive
+                _ = bs.pw_page.url
+                await bs.pw_page.evaluate("1 + 1")
+        except Exception:
+            # Connection is dead, clean up and reconnect
+            try:
+                await session.browser_session.close()
+            except Exception:
+                pass
+            session.browser_session = None
+
     if session.browser_session is None:
         session.browser_session = await create_browser_session(session.thread_id, headless=BROWSER_HEADLESS)
+
     session.browser_session.touch()
     return session.browser_session
 
@@ -180,43 +229,65 @@ def format_accessibility_tree(node: dict, indent: int = 0) -> str:
     return "\n".join(lines)
 
 
-async def get_accessibility_tree(page: Page) -> str:
-    """Extract accessibility tree from page using ARIA snapshot.
+async def get_accessibility_tree(browser_session: BrowserSession) -> str:
+    """Extract accessibility tree from page.
 
-    Uses the modern aria_snapshot() method which returns a YAML-like
-    representation of the accessibility tree.
+    For CDP mode: Uses cdp-browser's accessibility_tree() method
+    For Playwright: Uses aria_snapshot() on body
     """
     try:
-        # Use aria_snapshot on body - returns YAML-like accessibility tree
-        aria_snapshot = await page.locator("body").aria_snapshot()
-        if aria_snapshot:
-            # Truncate if too large
-            if len(aria_snapshot) > ACCESSIBILITY_MAX_LENGTH:
-                aria_snapshot = aria_snapshot[:ACCESSIBILITY_MAX_LENGTH] + "\n... (truncated)"
-            return aria_snapshot
-        return "(empty page)"
+        if browser_session.is_cdp and browser_session.cdp_page:
+            # Use cdp-browser's accessibility tree
+            tree = await browser_session.cdp_page.accessibility_tree()
+            if len(tree) > ACCESSIBILITY_MAX_LENGTH:
+                tree = tree[:ACCESSIBILITY_MAX_LENGTH] + "\n... (truncated)"
+            return tree
+        elif browser_session.pw_page:
+            # Use Playwright's aria_snapshot
+            aria_snapshot = await browser_session.pw_page.locator("body").aria_snapshot()
+            if aria_snapshot:
+                if len(aria_snapshot) > ACCESSIBILITY_MAX_LENGTH:
+                    aria_snapshot = aria_snapshot[:ACCESSIBILITY_MAX_LENGTH] + "\n... (truncated)"
+                return aria_snapshot
+            return "(empty page)"
+        return "(no page available)"
     except Exception as e:
         return f"(accessibility tree unavailable: {e})"
 
 
-async def take_screenshot(page: Page, session: "ClaudeSession") -> str:
+async def take_screenshot(browser_session: BrowserSession, session: "ClaudeSession") -> str:
     """Take screenshot and return temp file path."""
     import tempfile
     screenshot_path = Path(tempfile.gettempdir()) / f"browser_screenshot_{session.thread_id}_{int(time.time() * 1000)}.png"
-    await page.screenshot(path=str(screenshot_path))
+
+    if browser_session.is_cdp and browser_session.cdp_page:
+        await browser_session.cdp_page.screenshot(path=str(screenshot_path))
+    elif browser_session.pw_page:
+        await browser_session.pw_page.screenshot(path=str(screenshot_path))
+
     return str(screenshot_path)
 
 
-async def get_page_state(page: Page, session: "ClaudeSession") -> dict[str, str]:
+async def get_page_state(browser_session: BrowserSession, session: "ClaudeSession") -> dict[str, str]:
     """Get current page state including accessibility tree and screenshot."""
-    tree = await get_accessibility_tree(page)
-    screenshot_path = await take_screenshot(page, session)
+    tree = await get_accessibility_tree(browser_session)
+    screenshot_path = await take_screenshot(browser_session, session)
+
+    if browser_session.is_cdp and browser_session.cdp_page:
+        url = browser_session.cdp_page.url
+        title = await browser_session.cdp_page.title()
+    elif browser_session.pw_page:
+        url = browser_session.pw_page.url
+        title = await browser_session.pw_page.title()
+    else:
+        url = "unknown"
+        title = "unknown"
 
     return {
         "accessibility_tree": tree,
         "screenshot_path": screenshot_path,
-        "current_url": page.url,
-        "page_title": await page.title(),
+        "current_url": url,
+        "page_title": title,
     }
 
 
@@ -253,12 +324,15 @@ def create_browser_mcp_server(session: "ClaudeSession"):
             browser = await ensure_browser(session)
 
             # Navigate with reasonable timeout
-            await browser.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            if browser.is_cdp and browser.cdp_page:
+                await browser.cdp_page.goto(url, timeout=30.0)
+            elif browser.pw_page:
+                await browser.pw_page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # Brief wait for dynamic content (don't use networkidle - sites like Twitter never idle)
+            # Brief wait for dynamic content
             await asyncio.sleep(1)
 
-            state = await get_page_state(browser.page, session)
+            state = await get_page_state(browser, session)
 
             result_text = (
                 f"Navigated to: {state['current_url']}\n"
@@ -285,7 +359,7 @@ def create_browser_mcp_server(session: "ClaudeSession"):
         """Get current page state."""
         try:
             browser = await ensure_browser(session)
-            state = await get_page_state(browser.page, session)
+            state = await get_page_state(browser, session)
 
             result_text = (
                 f"URL: {state['current_url']}\n"
@@ -328,43 +402,58 @@ def create_browser_mcp_server(session: "ClaudeSession"):
         try:
             browser = await ensure_browser(session)
 
-            # Find element by role and optional name
-            if name:
-                locator = browser.page.get_by_role(role, name=name)
-            else:
-                locator = browser.page.get_by_role(role)
+            if browser.is_cdp and browser.cdp_page:
+                # Use cdp-browser click
+                try:
+                    await browser.cdp_page.click(role, name=name if name else None, index=index, timeout=10.0)
+                except CDPElementNotFoundError as e:
+                    state = await get_page_state(browser, session)
+                    return {
+                        "content": [{
+                            "type": "text",
+                            "text": f"No element found with role='{role}'" + (f" name='{name}'" if name else "") +
+                                    f"\n\nCurrent page state:\nScreenshot: {state['screenshot_path']}\n\n"
+                                    f"Accessibility Tree:\n{state['accessibility_tree']}"
+                        }],
+                        "is_error": True
+                    }
+            elif browser.pw_page:
+                # Use Playwright locator
+                if name:
+                    locator = browser.pw_page.get_by_role(role, name=name)
+                else:
+                    locator = browser.pw_page.get_by_role(role)
 
-            count = await locator.count()
-            if count == 0:
-                # Get current state to help user find the right element
-                state = await get_page_state(browser.page, session)
-                return {
-                    "content": [{
-                        "type": "text",
-                        "text": f"No element found with role='{role}'" + (f" name='{name}'" if name else "") +
-                                f"\n\nCurrent page state:\nScreenshot: {state['screenshot_path']}\n\n"
-                                f"Accessibility Tree:\n{state['accessibility_tree']}"
-                    }],
-                    "is_error": True
-                }
+                count = await locator.count()
+                if count == 0:
+                    state = await get_page_state(browser, session)
+                    return {
+                        "content": [{
+                            "type": "text",
+                            "text": f"No element found with role='{role}'" + (f" name='{name}'" if name else "") +
+                                    f"\n\nCurrent page state:\nScreenshot: {state['screenshot_path']}\n\n"
+                                    f"Accessibility Tree:\n{state['accessibility_tree']}"
+                        }],
+                        "is_error": True
+                    }
 
-            if index >= count:
-                return {
-                    "content": [{
-                        "type": "text",
-                        "text": f"Index {index} out of range. Found {count} element(s) with role='{role}'" +
-                                (f" name='{name}'" if name else "")
-                    }],
-                    "is_error": True
-                }
+                if index >= count:
+                    return {
+                        "content": [{
+                            "type": "text",
+                            "text": f"Index {index} out of range. Found {count} element(s) with role='{role}'" +
+                                    (f" name='{name}'" if name else "")
+                        }],
+                        "is_error": True
+                    }
 
-            # Click the element
-            await locator.nth(index).click()
+                await locator.nth(index).click()
+                await browser.pw_page.wait_for_load_state("domcontentloaded", timeout=5000)
 
-            # Wait for any navigation or dynamic updates
-            await browser.page.wait_for_load_state("domcontentloaded", timeout=5000)
+            # Brief wait for any dynamic updates after click
+            await asyncio.sleep(0.5)
 
-            state = await get_page_state(browser.page, session)
+            state = await get_page_state(browser, session)
 
             result_text = (
                 f"Clicked: [{role}] \"{name}\"" + (f" (index {index})" if index > 0 else "") + "\n"
@@ -379,7 +468,7 @@ def create_browser_mcp_server(session: "ClaudeSession"):
             # Try to get page state even on error
             try:
                 browser = await ensure_browser(session)
-                state = await get_page_state(browser.page, session)
+                state = await get_page_state(browser, session)
                 error_context = f"\n\nCurrent state:\nScreenshot: {state['screenshot_path']}"
             except Exception:
                 error_context = ""
@@ -416,43 +505,59 @@ def create_browser_mcp_server(session: "ClaudeSession"):
         try:
             browser = await ensure_browser(session)
 
-            # If role provided, find and interact with that element
-            if role:
-                if name:
-                    locator = browser.page.get_by_role(role, name=name)
+            if browser.is_cdp and browser.cdp_page:
+                # Use cdp-browser type
+                if role:
+                    try:
+                        await browser.cdp_page.type(role, name=name if name else None, text=text, timeout=10.0)
+                    except CDPElementNotFoundError:
+                        state = await get_page_state(browser, session)
+                        return {
+                            "content": [{
+                                "type": "text",
+                                "text": f"No element found with role='{role}'" + (f" name='{name}'" if name else "") +
+                                        f"\n\nScreenshot: {state['screenshot_path']}\n\n"
+                                        f"Accessibility Tree:\n{state['accessibility_tree']}"
+                            }],
+                            "is_error": True
+                        }
+                if press_enter:
+                    await browser.cdp_page.press("Enter")
+            elif browser.pw_page:
+                # Use Playwright
+                if role:
+                    if name:
+                        locator = browser.pw_page.get_by_role(role, name=name)
+                    else:
+                        locator = browser.pw_page.get_by_role(role)
+
+                    count = await locator.count()
+                    if count == 0:
+                        state = await get_page_state(browser, session)
+                        return {
+                            "content": [{
+                                "type": "text",
+                                "text": f"No element found with role='{role}'" + (f" name='{name}'" if name else "") +
+                                        f"\n\nScreenshot: {state['screenshot_path']}\n\n"
+                                        f"Accessibility Tree:\n{state['accessibility_tree']}"
+                            }],
+                            "is_error": True
+                        }
+
+                    if text:
+                        await locator.first.fill(text)
+                    if press_enter:
+                        await locator.first.press("Enter")
                 else:
-                    locator = browser.page.get_by_role(role)
-
-                count = await locator.count()
-                if count == 0:
-                    state = await get_page_state(browser.page, session)
-                    return {
-                        "content": [{
-                            "type": "text",
-                            "text": f"No element found with role='{role}'" + (f" name='{name}'" if name else "") +
-                                    f"\n\nScreenshot: {state['screenshot_path']}\n\n"
-                                    f"Accessibility Tree:\n{state['accessibility_tree']}"
-                        }],
-                        "is_error": True
-                    }
-
-                # Fill the element (clears existing text first)
-                if text:
-                    await locator.first.fill(text)
-
-                if press_enter:
-                    await locator.first.press("Enter")
-            else:
-                # Type into currently focused element
-                if text:
-                    await browser.page.keyboard.type(text)
-                if press_enter:
-                    await browser.page.keyboard.press("Enter")
+                    if text:
+                        await browser.pw_page.keyboard.type(text)
+                    if press_enter:
+                        await browser.pw_page.keyboard.press("Enter")
 
             # Wait for any updates
             await asyncio.sleep(0.5)
 
-            state = await get_page_state(browser.page, session)
+            state = await get_page_state(browser, session)
 
             action = f"Typed: \"{text[:50]}{'...' if len(text) > 50 else ''}\""
             if press_enter:
@@ -502,24 +607,54 @@ def create_browser_mcp_server(session: "ClaudeSession"):
         try:
             browser = await ensure_browser(session)
 
-            if direction == "top":
-                await browser.page.evaluate("window.scrollTo(0, 0)")
-            elif direction == "bottom":
-                await browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            elif direction == "up":
-                await browser.page.evaluate(f"window.scrollBy(0, -{pixels})")
-            else:  # down
-                await browser.page.evaluate(f"window.scrollBy(0, {pixels})")
+            # Get the page object (either CDP or Playwright)
+            if browser.is_cdp and browser.cdp_page:
+                cdp_page = browser.cdp_page
 
-            # Wait for any lazy-loaded content
-            await asyncio.sleep(0.3)
+                if direction == "top":
+                    await cdp_page.evaluate("window.scrollTo(0, 0)")
+                elif direction == "bottom":
+                    await cdp_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                elif direction == "up":
+                    await cdp_page.evaluate(f"window.scrollBy(0, -{pixels})")
+                else:  # down
+                    await cdp_page.evaluate(f"window.scrollBy(0, {pixels})")
 
-            state = await get_page_state(browser.page, session)
+                # Wait for any lazy-loaded content
+                await asyncio.sleep(0.3)
 
-            # Get scroll position
-            scroll_pos = await browser.page.evaluate(
-                "() => ({ x: window.scrollX, y: window.scrollY, height: document.body.scrollHeight })"
-            )
+                state = await get_page_state(browser, session)
+
+                # Get scroll position (use direct object literal, not arrow function for CDP)
+                scroll_pos = await cdp_page.evaluate(
+                    "({ x: window.scrollX, y: window.scrollY, height: document.body.scrollHeight })"
+                )
+            elif browser.pw_page:
+                pw_page = browser.pw_page
+
+                if direction == "top":
+                    await pw_page.evaluate("window.scrollTo(0, 0)")
+                elif direction == "bottom":
+                    await pw_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                elif direction == "up":
+                    await pw_page.evaluate(f"window.scrollBy(0, -{pixels})")
+                else:  # down
+                    await pw_page.evaluate(f"window.scrollBy(0, {pixels})")
+
+                # Wait for any lazy-loaded content
+                await asyncio.sleep(0.3)
+
+                state = await get_page_state(browser, session)
+
+                # Get scroll position
+                scroll_pos = await pw_page.evaluate(
+                    "() => ({ x: window.scrollX, y: window.scrollY, height: document.body.scrollHeight })"
+                )
+            else:
+                return {
+                    "content": [{"type": "text", "text": "Error: no page available"}],
+                    "is_error": True
+                }
 
             result_text = (
                 f"Scrolled {direction}" + (f" {pixels}px" if direction in ["up", "down"] else "") + "\n"
