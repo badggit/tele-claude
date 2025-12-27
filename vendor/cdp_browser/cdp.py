@@ -151,6 +151,8 @@ class CDPSession:
 
         # Event
         method = message.get("method")
+        if method is None:
+            return
         params = message.get("params", {})
         session_id = message.get("sessionId")
         for sid in {session_id, None}:

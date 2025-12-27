@@ -302,8 +302,10 @@ class Page:
         node_map = {n["nodeId"]: n for n in nodes if "nodeId" in n}
         parents: dict[str, str] = {}
         for node in nodes:
-            for child_id in node.get("childIds", []):
-                parents[child_id] = node.get("nodeId")
+            node_id = node.get("nodeId")
+            if node_id is not None:
+                for child_id in node.get("childIds", []):
+                    parents[child_id] = node_id
         roots = [nid for nid in node_map if nid not in parents]
         lines: list[str] = []
 
