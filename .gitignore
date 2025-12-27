@@ -85,3 +85,6 @@ Thumbs.db
 *.log
 captures/
 logs/
+
+# Claude skills (personal/private)
+.claude/skills/
