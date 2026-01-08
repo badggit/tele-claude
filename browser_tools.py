@@ -161,11 +161,14 @@ async def ensure_browser(session: "ClaudeSession") -> BrowserSession:
                 await bs.pw_page.evaluate("1 + 1")
         except Exception:
             # Connection is dead, clean up and reconnect
+            global _cdp_browser
             try:
                 await session.browser_session.close()
             except Exception:
                 pass
             session.browser_session = None
+            # Also reset global CDP browser so get_cdp_browser() creates fresh connection
+            _cdp_browser = None
 
     if session.browser_session is None:
         session.browser_session = await create_browser_session(session.thread_id, headless=BROWSER_HEADLESS)
