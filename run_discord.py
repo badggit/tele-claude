@@ -35,13 +35,18 @@ class ClaudeBotClient(discord.Client):
         if message.author.bot:
             return
 
-        # Handle attachments (images)
-        if message.attachments:
-            await handle_attachment(message, self)
-            if not message.content:  # Image only, no text
-                return
+        # Check for image attachments
+        has_image = any(
+            a.content_type and a.content_type.startswith('image/')
+            for a in message.attachments
+        )
 
-        # Handle text messages
+        if has_image:
+            # handle_attachment deals with image + optional caption
+            await handle_attachment(message, self)
+            return
+
+        # Handle text-only messages
         if message.content:
             await handle_message(message, self)
 

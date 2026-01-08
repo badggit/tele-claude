@@ -1,19 +1,19 @@
 """Discord bot handlers for Claude Code bridge.
 
 Handles messages and interactions, forwarding to Claude sessions.
-Key difference from Telegram: channel = project directory (no folder picker).
+Model: channel = project, thread = conversation (like Telegram forum topics).
 """
 
 import asyncio
 import logging
 import os
 import tempfile
-from typing import Optional
+from typing import Optional, Union
 
 import discord
 
 from config import DISCORD_ALLOWED_GUILDS, DISCORD_CHANNEL_PROJECTS
-from session import sessions, start_session_discord, send_to_claude, resolve_permission, interrupt_session
+from session import sessions, start_session_discord, start_session_ambient_discord, send_to_claude, resolve_permission, interrupt_session, stop_session
 from commands import get_command_prompt, get_help_message
 
 logger = logging.getLogger("tele-claude.discord.handlers")
@@ -30,150 +30,288 @@ def is_authorized_guild(guild_id: Optional[int]) -> bool:
 
 def get_project_for_channel(channel_id: int) -> Optional[str]:
     """Get project directory for a channel from config.
-    
+
     Returns None if channel is not mapped to a project.
     """
     return DISCORD_CHANNEL_PROJECTS.get(channel_id)
 
 
+def _get_parent_channel_id(channel: Union[discord.TextChannel, discord.Thread]) -> int:
+    """Get the parent channel ID (for threads) or the channel ID itself."""
+    if isinstance(channel, discord.Thread):
+        return channel.parent_id or channel.id
+    return channel.id
+
+
+def _is_general_channel(channel: discord.abc.Messageable) -> bool:
+    """Check if channel is #general (ambient channel for home folder sessions)."""
+    # Get the actual channel (parent if thread)
+    if isinstance(channel, discord.Thread):
+        parent = channel.parent
+        if parent:
+            return parent.name.lower() == "general"
+        return False
+    if isinstance(channel, discord.TextChannel):
+        return channel.name.lower() == "general"
+    return False
+
+
 async def handle_message(message: discord.Message, bot: discord.Client) -> None:
-    """Handle incoming Discord message."""
+    """Handle incoming Discord message.
+
+    If message is in a project channel: create a thread and start session there.
+    If message is in a thread: continue session in that thread.
+    """
     # Ignore bot messages
     if message.author.bot:
         return
-    
+
     # Authorization check
     guild_id = message.guild.id if message.guild else None
     if not is_authorized_guild(guild_id):
         logger.warning(f"Unauthorized message from guild {guild_id}")
         return
-    
-    channel_id = message.channel.id
+
     text = message.content
-    
-    # Check if this channel has an active session
-    if channel_id in sessions:
-        session = sessions[channel_id]
-        
-        # Check for slash commands
-        prompt = text
-        if text.startswith("/"):
-            command_part = text.split()[0]
-            command_name = command_part.lstrip("/")
-            
-            cmd_prompt = get_command_prompt(command_name, session.contextual_commands)
-            if cmd_prompt is not None:
-                prompt = cmd_prompt
-                logger.debug(f"Executing slash command /{command_name}")
-        
-        # Handle pending image
-        pending_image = session.pending_image_path
-        if pending_image:
-            session.pending_image_path = None
-            prompt = f"{pending_image}\n\n{prompt}"
-        
-        # Interrupt ongoing query
-        was_interrupted = await interrupt_session(channel_id)
-        if was_interrupted:
-            await asyncio.sleep(0.1)
-        
-        # Run as background task
-        asyncio.create_task(send_to_claude(channel_id, prompt, None))
+    channel = message.channel
+
+    # Determine if we're in a thread or a channel
+    if isinstance(channel, discord.Thread):
+        # Message is in a thread - use thread ID as session key
+        thread_id = channel.id
+        parent_channel_id = channel.parent_id or channel.id
+
+        # Check if this thread has an active session
+        if thread_id in sessions:
+            session = sessions[thread_id]
+
+            # Check for slash commands
+            prompt = text
+            if text.startswith("/"):
+                command_part = text.split()[0]
+                command_name = command_part.lstrip("/")
+
+                # Handle built-in /help command
+                if command_name == "help":
+                    await handle_help(message)
+                    return
+
+                # Handle /close command - stop session and archive thread
+                if command_name == "close":
+                    await handle_close(message)
+                    return
+
+                cmd_prompt = get_command_prompt(command_name, session.contextual_commands)
+                if cmd_prompt is not None:
+                    prompt = cmd_prompt
+                    logger.debug(f"Executing slash command /{command_name}")
+
+            # Handle pending image
+            pending_image = session.pending_image_path
+            if pending_image:
+                session.pending_image_path = None
+                prompt = f"{pending_image}\n\n{prompt}"
+
+            # Interrupt ongoing query
+            was_interrupted = await interrupt_session(thread_id)
+            if was_interrupted:
+                await asyncio.sleep(0.1)
+
+            # Run as background task
+            asyncio.create_task(send_to_claude(thread_id, prompt, None))
+            return
+
+        # No session in this thread - check if parent channel is a project channel or #general
+        project_path = get_project_for_channel(parent_channel_id)
+        if project_path:
+            # Start new session in this thread
+            success = await start_session_discord(thread_id, project_path, channel)
+            if success:
+                asyncio.create_task(send_to_claude(thread_id, text, None))
+            else:
+                await channel.send(f"Failed to start session: project not found")
+        elif _is_general_channel(channel):
+            # Start ambient session for #general thread
+            success = await start_session_ambient_discord(thread_id, channel)
+            if success:
+                asyncio.create_task(send_to_claude(thread_id, text, None))
+            else:
+                await channel.send(f"Failed to start ambient session")
         return
-    
-    # Check if channel is mapped to a project
+
+    # Message is in a channel (not a thread)
+    channel_id = channel.id
     project_path = get_project_for_channel(channel_id)
+
     if project_path:
-        # Auto-start session for this channel
-        success = await start_session_discord(channel_id, project_path, message.channel)
-        if success:
-            # Now send the message to the new session
-            asyncio.create_task(send_to_claude(channel_id, text, None))
-        else:
-            await message.channel.send(f"Failed to start session: project '{project_path}' not found")
+        # Create a new thread for this conversation
+        thread_name = text[:100] if text else "Claude session"
+        try:
+            thread = await message.create_thread(name=thread_name)
+            logger.info(f"Created thread '{thread_name}' for project {project_path}")
+
+            # Start session in the new thread
+            success = await start_session_discord(thread.id, project_path, thread)
+            if success:
+                asyncio.create_task(send_to_claude(thread.id, text, None))
+            else:
+                await thread.send(f"Failed to start session: project not found")
+        except Exception as e:
+            logger.error(f"Failed to create thread: {e}")
+            await message.reply(f"Failed to create thread: {e}")
+
+    elif _is_general_channel(channel):
+        # #general channel - create thread and start ambient session
+        thread_name = text[:100] if text else "Claude session"
+        try:
+            thread = await message.create_thread(name=thread_name)
+            logger.info(f"Created thread '{thread_name}' in #general (ambient)")
+
+            success = await start_session_ambient_discord(thread.id, thread)
+            if success:
+                asyncio.create_task(send_to_claude(thread.id, text, None))
+            else:
+                await thread.send(f"Failed to start ambient session")
+        except Exception as e:
+            logger.error(f"Failed to create thread: {e}")
+            await message.reply(f"Failed to create thread: {e}")
 
 
 async def handle_attachment(message: discord.Message, bot: discord.Client) -> None:
     """Handle message with image attachment."""
     if message.author.bot:
         return
-    
+
     guild_id = message.guild.id if message.guild else None
     if not is_authorized_guild(guild_id):
         return
-    
-    channel_id = message.channel.id
-    if channel_id not in sessions:
-        return
-    
-    session = sessions[channel_id]
-    
+
+    channel = message.channel
+
     # Find image attachment
     image_attachment = None
     for attachment in message.attachments:
         if attachment.content_type and attachment.content_type.startswith('image/'):
             image_attachment = attachment
             break
-    
+
     if not image_attachment:
         return
-    
+
     # Download image to temp directory
     from pathlib import Path
     image_path = Path(tempfile.gettempdir()) / f"discord_image_{image_attachment.id}.png"
     await image_attachment.save(image_path)
-    image_path = str(image_path)  # Convert back to str for session
-    
-    caption = message.content
-    if caption:
-        # Image with caption - send immediately
-        prompt = f"{image_path}\n\n{caption}"
-        was_interrupted = await interrupt_session(channel_id)
-        if was_interrupted:
-            await asyncio.sleep(0.1)
-        asyncio.create_task(send_to_claude(channel_id, prompt, None))
-    else:
-        # Image without caption - buffer for next text message
-        session.pending_image_path = image_path
+    image_path = str(image_path)
+
+    caption = message.content or "What's in this image?"
+
+    # If in a channel, create a thread first
+    if not isinstance(channel, discord.Thread):
+        channel_id = channel.id
+        project_path = get_project_for_channel(channel_id)
+
+        if project_path:
+            thread_name = caption[:100] if caption else "Image analysis"
+            try:
+                thread = await message.create_thread(name=thread_name)
+                logger.info(f"Created thread '{thread_name}' for image in {project_path}")
+
+                success = await start_session_discord(thread.id, project_path, thread)
+                if success:
+                    prompt = f"{image_path}\n\n{caption}"
+                    asyncio.create_task(send_to_claude(thread.id, prompt, None))
+                else:
+                    await thread.send("Failed to start session: project not found")
+            except Exception as e:
+                logger.error(f"Failed to create thread for image: {e}")
+                await message.reply(f"Failed to create thread: {e}")
+
+        elif _is_general_channel(channel):
+            # #general channel - create thread and start ambient session for image
+            thread_name = caption[:100] if caption else "Image analysis"
+            try:
+                thread = await message.create_thread(name=thread_name)
+                logger.info(f"Created thread '{thread_name}' for image in #general (ambient)")
+
+                success = await start_session_ambient_discord(thread.id, thread)
+                if success:
+                    prompt = f"{image_path}\n\n{caption}"
+                    asyncio.create_task(send_to_claude(thread.id, prompt, None))
+                else:
+                    await thread.send("Failed to start ambient session")
+            except Exception as e:
+                logger.error(f"Failed to create thread for image: {e}")
+                await message.reply(f"Failed to create thread: {e}")
+        return
+
+    # In a thread - use existing session or start new one
+    thread_id = channel.id
+    parent_channel_id = channel.parent_id or channel.id
+
+    if thread_id not in sessions:
+        # Start session if parent is a project channel or #general
+        project_path = get_project_for_channel(parent_channel_id)
+        if project_path:
+            success = await start_session_discord(thread_id, project_path, channel)
+            if not success:
+                await channel.send("Failed to start session: project not found")
+        elif _is_general_channel(channel):
+            success = await start_session_ambient_discord(thread_id, channel)
+            if not success:
+                await channel.send("Failed to start ambient session")
+                return
+        else:
+            return
+
+    session = sessions[thread_id]
+    prompt = f"{image_path}\n\n{caption}"
+
+    was_interrupted = await interrupt_session(thread_id)
+    if was_interrupted:
+        await asyncio.sleep(0.1)
+
+    asyncio.create_task(send_to_claude(thread_id, prompt, None))
 
 
 async def handle_interaction(interaction: discord.Interaction) -> None:
     """Handle button interactions (permission responses)."""
     if not interaction.data:
         return
-    
+
     custom_id = interaction.data.get("custom_id", "")
-    
+
     # Handle permission responses: "perm:<action>:<request_id>:<tool_name>"
     if custom_id.startswith("perm:"):
         parts = custom_id.split(":", 3)
         if len(parts) != 4:
             await interaction.response.send_message("Invalid permission callback", ephemeral=True)
             return
-        
+
         _, action, request_id, tool_name = parts
-        
-        # Get session for logging
-        channel_id = interaction.channel_id
-        session = sessions.get(channel_id) if channel_id else None
-        
+
+        # Get session for logging - check thread ID first, then channel
+        channel = interaction.channel
+        session_id = channel.id if channel else None
+        session = sessions.get(session_id) if session_id else None
+
         if session and session.logger:
             session.logger.log_permission_callback(request_id, action, tool_name)
-        
+
         if action == "allow":
             success = await resolve_permission(request_id, allowed=True, always=False, tool_name=tool_name)
             if success:
                 await interaction.response.edit_message(content=f"✅ Allowed `{tool_name}` (one-time)", view=None)
             else:
                 await interaction.response.edit_message(content="⚠️ Permission request expired", view=None)
-        
+
         elif action == "deny":
             success = await resolve_permission(request_id, allowed=False, always=False, tool_name=tool_name)
             if success:
                 await interaction.response.edit_message(content=f"❌ Denied `{tool_name}`", view=None)
             else:
                 await interaction.response.edit_message(content="⚠️ Permission request expired", view=None)
-        
+
         elif action == "always":
             success = await resolve_permission(request_id, allowed=True, always=True, tool_name=tool_name)
             if success:
@@ -184,13 +322,36 @@ async def handle_interaction(interaction: discord.Interaction) -> None:
 
 async def handle_help(message: discord.Message) -> None:
     """Handle /help command."""
-    channel_id = message.channel.id
-    
+    channel = message.channel
+    session_id = channel.id
+
     contextual_commands: list = []
-    if channel_id in sessions:
-        contextual_commands = sessions[channel_id].contextual_commands
-    
+    if session_id in sessions:
+        contextual_commands = sessions[session_id].contextual_commands
+
     help_text = get_help_message(contextual_commands)
-    # Discord uses markdown, so strip HTML and use plain markdown
-    # The help message is already markdown-friendly
-    await message.channel.send(help_text)
+    await channel.send(help_text)
+
+
+async def handle_close(message: discord.Message) -> None:
+    """Handle /close command - stop session and archive thread."""
+    channel = message.channel
+
+    if not isinstance(channel, discord.Thread):
+        await channel.send("This command only works in threads.")
+        return
+
+    thread_id = channel.id
+
+    # Stop the Claude session if it exists
+    if thread_id in sessions:
+        await stop_session(thread_id)
+        await channel.send("Session closed.")
+
+    # Archive the thread
+    try:
+        await channel.edit(archived=True)
+        logger.info(f"Archived thread {thread_id}")
+    except Exception as e:
+        logger.error(f"Failed to archive thread: {e}")
+        await channel.send(f"Failed to archive thread: {e}")

@@ -70,8 +70,8 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
     """
 
     @tool(
-        "send_to_telegram",
-        "Send a file to the Telegram chat. Use this when the user asks you to share a file, "
+        "send_file",
+        "Send a file to the chat. Use this when the user asks you to share a file, "
         "send output as a file, or when a file would be more useful than inline text "
         "(e.g., large outputs, generated images, code files). "
         "The file must exist within the project directory.",
@@ -80,7 +80,7 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
             "caption": str,
         }
     )
-    async def send_to_telegram(args: dict[str, Any]) -> dict[str, Any]:
+    async def send_file(args: dict[str, Any]) -> dict[str, Any]:
         """Send a file to the chat using the platform abstraction."""
         file_path = args.get("file_path", "")
         caption = args.get("caption", "")
@@ -119,7 +119,7 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
 
         # Log the tool usage
         if session.logger:
-            session.logger.log_tool_call("send_to_telegram", {
+            session.logger.log_tool_call("send_file", {
                 "file_path": str(resolved_path),
                 "caption": caption,
                 "size_bytes": file_size
@@ -135,7 +135,7 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
             # Log success
             if session.logger:
                 session.logger.log_tool_result(
-                    "send_to_telegram",
+                    "send_file",
                     f"Sent {resolved_path.name}",
                     success=True
                 )
@@ -151,8 +151,8 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
             error_text = f"Failed to send file: {str(e)}"
 
             if session.logger:
-                session.logger.log_tool_result("send_to_telegram", error_text, success=False)
-                session.logger.log_error("send_to_telegram", e)
+                session.logger.log_tool_result("send_file", error_text, success=False)
+                session.logger.log_error("send_file", e)
 
             return {
                 "content": [{"type": "text", "text": f"Error: {error_text}"}],
@@ -160,7 +160,7 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
             }
 
     return create_sdk_mcp_server(
-        name="telegram-tools",
+        name="chat-tools",
         version="1.0.0",
-        tools=[send_to_telegram]
+        tools=[send_file]
     )

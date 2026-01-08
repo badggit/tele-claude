@@ -470,13 +470,48 @@ async def _start_session_impl(
     return True
 
 
-async def start_session_discord(channel_id: int, project_path: str, channel: Any) -> bool:
+async def start_session_ambient(chat_id: int, thread_id: int, bot: Bot) -> bool:
+    """Start an ambient Claude session with home folder as cwd.
+
+    Used for #general or other permanent ambient sessions that don't
+    need a specific project folder.
+
+    Args:
+        chat_id: Telegram chat ID
+        thread_id: Telegram thread ID (e.g., GENERAL_TOPIC_ID)
+        bot: Telegram Bot instance
+
+    Returns:
+        True if session started successfully
+    """
+    home_dir = str(Path.home())
+    return await _start_session_impl(chat_id, thread_id, home_dir, "~", bot)
+
+
+async def start_session_ambient_discord(channel_id: int, channel: Any) -> bool:
+    """Start an ambient Claude session for Discord with home folder as cwd.
+
+    Used for #general or other ambient channels that don't need a specific project.
+
+    Args:
+        channel_id: Discord channel ID (used as session key)
+        channel: Discord channel object (TextChannel, Thread, or similar)
+
+    Returns:
+        True if session started successfully
+    """
+    home_dir = str(Path.home())
+    return await start_session_discord(channel_id, home_dir, channel, display_name="~")
+
+
+async def start_session_discord(channel_id: int, project_path: str, channel: Any, display_name: Optional[str] = None) -> bool:
     """Start a new Claude session for a Discord channel.
 
     Args:
         channel_id: Discord channel ID (used as session key)
         project_path: Absolute path to project directory
         channel: Discord channel object (TextChannel or similar)
+        display_name: Optional display name (defaults to folder name)
 
     Returns:
         True if session started successfully
@@ -489,7 +524,7 @@ async def start_session_discord(channel_id: int, project_path: str, channel: Any
     if not cwd_path.exists():
         return False
 
-    display_name = cwd_path.name
+    display_name = display_name or cwd_path.name
 
     # Create logger - use project-local logs
     logs_dir = cwd_path / ".bot-logs"
@@ -586,12 +621,13 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
     last_usage: Optional[dict] = None
 
     def format_current_tool_buffer() -> str:
-        """Format current tool buffer contents."""
+        """Format current tool buffer contents using session formatter."""
+        formatter = session.get_formatter()
         if len(tool_buffer) == 1:
             name, input_dict = tool_buffer[0]
-            return format_tool_call(name, input_dict)
+            return formatter.format_tool_call(name, input_dict)
         else:
-            return format_tool_calls_batch(tool_buffer_name or "Tool", tool_buffer)
+            return formatter.format_tool_calls_batch(tool_buffer_name or "Tool", tool_buffer)
 
     async def update_tool_buffer_message():
         """Send or edit the tool buffer message."""

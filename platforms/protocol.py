@@ -210,3 +210,27 @@ class MessageFormatter(Protocol):
     def blockquote(self, text: str) -> str:
         """Format text as a blockquote."""
         ...
+
+    def format_tool_call(self, name: str, args: dict) -> str:
+        """Format a tool call for display.
+
+        Args:
+            name: Tool name
+            args: Tool arguments dict
+
+        Returns:
+            Formatted tool call string (e.g., "🔧 **Read**(file=foo.py)")
+        """
+        ...
+
+    def format_tool_calls_batch(self, tool_name: str, calls: list[tuple[str, dict]]) -> str:
+        """Format multiple tool calls of same type as a single message.
+
+        Args:
+            tool_name: Common name for the batch
+            calls: List of (name, args) tuples
+
+        Returns:
+            Formatted batch message
+        """
+        ...
