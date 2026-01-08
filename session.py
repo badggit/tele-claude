@@ -3,6 +3,8 @@ Claude Code SDK session management for Telegram bot.
 
 Manages conversations with Claude through the Code SDK,
 streaming responses to Telegram messages.
+
+Supports multiple platforms via PlatformClient abstraction.
 """
 import asyncio
 import json
@@ -31,6 +33,10 @@ from diff_image import edit_to_image
 from commands import load_contextual_commands, register_commands_for_chat
 from mcp_tools import create_telegram_mcp_server
 from browser_tools import create_browser_mcp_server, BrowserSession
+
+# Platform abstraction imports
+from platforms import PlatformClient, MessageFormatter, ButtonSpec, ButtonRow, MessageRef
+from platforms.telegram import TelegramClient, TelegramFormatter
 
 # Module logger (named _log to avoid collision with SessionLogger variables named 'logger')
 _log = logging.getLogger("tele-claude.session")
@@ -123,11 +129,20 @@ async def resolve_permission(request_id: str, allowed: bool, always: bool = Fals
 
 @dataclass
 class ClaudeSession:
-    """Represents an active Claude session for a Telegram thread."""
+    """Represents an active Claude session for a chat thread.
+
+    Supports both legacy Telegram-specific mode (via bot field) and
+    platform-agnostic mode (via platform field).
+    """
     chat_id: int
     thread_id: int
     cwd: str
-    bot: Optional[Bot] = None  # Reference for permission prompts
+    # Platform abstraction (preferred)
+    platform: Optional[PlatformClient] = None
+    formatter: Optional[MessageFormatter] = None
+    # Legacy Telegram support (deprecated - use platform instead)
+    bot: Optional[Bot] = None  # Will be removed in future version
+    # Session state
     logger: Optional[SessionLogger] = None
     last_send: float = field(default_factory=time.time)
     send_interval: float = 1.0
@@ -139,6 +154,29 @@ class ClaudeSession:
     pending_image_path: Optional[str] = None  # Buffered image waiting for prompt
     contextual_commands: list = field(default_factory=list)  # Project-specific slash commands
     browser_session: Optional[BrowserSession] = None  # Browser automation session
+
+    def get_platform(self) -> Optional[PlatformClient]:
+        """Get platform client, creating from bot if needed (backwards compat)."""
+        if self.platform:
+            return self.platform
+        if self.bot:
+            # Create TelegramClient wrapper for legacy bot
+            self.platform = TelegramClient(
+                bot=self.bot,
+                chat_id=self.chat_id,
+                thread_id=self.thread_id,
+                logger=self.logger,
+            )
+            return self.platform
+        return None
+
+    def get_formatter(self) -> MessageFormatter:
+        """Get message formatter, defaulting to Telegram."""
+        if self.formatter:
+            return self.formatter
+        # Default to Telegram formatter for backwards compat
+        self.formatter = TelegramFormatter()
+        return self.formatter
 
 
 async def interrupt_session(thread_id: int) -> bool:
@@ -159,11 +197,17 @@ async def request_tool_permission(
     tool_name: str,
     tool_input: dict
 ) -> bool:
-    """Send permission request to Telegram and wait for user response."""
-    if session.bot is None:
+    """Send permission request and wait for user response.
+
+    Uses platform abstraction for cross-platform support.
+    """
+    platform = session.get_platform()
+    if platform is None:
         if session.logger:
-            session.logger.log_error("request_tool_permission", Exception("No bot reference available"))
+            session.logger.log_error("request_tool_permission", Exception("No platform client available"))
         return False
+
+    formatter = session.get_formatter()
 
     # Generate unique request ID
     request_id = str(uuid.uuid4())[:8]
@@ -174,35 +218,30 @@ async def request_tool_permission(
         v_str = str(v)
         if len(v_str) > 100:
             v_str = v_str[:100] + "..."
-        v_str = escape_html(v_str)
-        input_preview.append(f"  <code>{k}</code>: {v_str}")
+        v_str = formatter.escape_text(v_str)
+        input_preview.append(f"  {formatter.code(k)}: {v_str}")
     input_text = "\n".join(input_preview) if input_preview else "  (no arguments)"
 
-    # Build message with inline keyboard
+    # Build message text using formatter
     message_text = (
-        f"🔐 <b>Permission Request</b>\n\n"
-        f"Tool: <code>{tool_name}</code>\n"
+        f"🔐 {formatter.bold('Permission Request')}\n\n"
+        f"Tool: {formatter.code(tool_name)}\n"
         f"Arguments:\n{input_text}"
     )
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Allow", callback_data=f"perm:allow:{request_id}:{tool_name}"),
-            InlineKeyboardButton("❌ Deny", callback_data=f"perm:deny:{request_id}:{tool_name}"),
-        ],
-        [
-            InlineKeyboardButton("✅ Always Allow", callback_data=f"perm:always:{request_id}:{tool_name}"),
-        ]
-    ])
+    # Build platform-agnostic keyboard
+    buttons = [
+        ButtonRow([
+            ButtonSpec("✅ Allow", f"perm:allow:{request_id}:{tool_name}"),
+            ButtonSpec("❌ Deny", f"perm:deny:{request_id}:{tool_name}"),
+        ]),
+        ButtonRow([
+            ButtonSpec("✅ Always Allow", f"perm:always:{request_id}:{tool_name}"),
+        ])
+    ]
 
     # Send permission request message
-    await session.bot.send_message(
-        chat_id=session.chat_id,
-        message_thread_id=session.thread_id,
-        text=message_text,
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
+    await platform.send_message(message_text, buttons=buttons)
 
     # Log the permission request
     if session.logger:
@@ -227,11 +266,8 @@ async def request_tool_permission(
         pending_permissions.pop(request_id, None)
         if session.logger:
             session.logger.log_debug("permission", "Request timed out", request_id=request_id)
-        await session.bot.send_message(
-            chat_id=session.chat_id,
-            message_thread_id=session.thread_id,
-            text="⏰ Permission request timed out (denied)"
-        )
+        if platform:
+            await platform.send_message("⏰ Permission request timed out (denied)")
         return False
 
 
@@ -288,13 +324,13 @@ def create_pre_compact_hook(session: ClaudeSession):
                 # Cast to dict for logging since HookInput is a TypedDict
                 session.logger.log_compact_event(dict(input_data))  # type: ignore[arg-type]
 
-            # Notify user in chat
-            if session.bot:
-                await session.bot.send_message(
-                    chat_id=session.chat_id,
-                    message_thread_id=session.thread_id,
-                    text="📦 <b>Context compacting...</b>\nConversation history is being summarized to free up space.",
-                    parse_mode="HTML"
+            # Notify user in chat using platform abstraction
+            platform = session.get_platform()
+            if platform:
+                formatter = session.get_formatter()
+                await platform.send_message(
+                    f"📦 {formatter.bold('Context compacting...')}\n"
+                    "Conversation history is being summarized to free up space."
                 )
         except Exception as e:
             if session.logger:
@@ -397,12 +433,23 @@ async def _start_session_impl(
     # Load contextual commands from project's commands/ directory
     contextual_commands = load_contextual_commands(cwd)
 
-    # Store session with bot reference
+    # Create platform client and formatter
+    platform = TelegramClient(
+        bot=bot,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        logger=logger,
+    )
+    formatter = TelegramFormatter()
+
+    # Store session with platform abstraction
     sessions[thread_id] = ClaudeSession(
         chat_id=chat_id,
         thread_id=thread_id,
         cwd=cwd,
-        bot=bot,
+        platform=platform,
+        formatter=formatter,
+        bot=bot,  # Keep for backwards compat
         logger=logger,
         contextual_commands=contextual_commands,
     )
@@ -410,13 +457,8 @@ async def _start_session_impl(
     # Register commands with Telegram for autocompletion
     await register_commands_for_chat(bot, chat_id, contextual_commands)
 
-    # Send welcome message
-    await bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=thread_id,
-        text=f"Claude session started in <code>{display_name}</code>",
-        parse_mode="HTML"
-    )
+    # Send welcome message using platform
+    await platform.send_message(f"Claude session started in {formatter.code(display_name)}")
 
     return True
 
@@ -945,58 +987,46 @@ async def send_message(
     return msg
 
 
-async def send_typing_action(session: ClaudeSession, bot: Bot) -> None:
-    """Send typing indicator if enough time has passed."""
+async def send_typing_action(session: ClaudeSession, bot: Optional[Bot] = None) -> None:
+    """Send typing indicator if enough time has passed.
+
+    Uses platform abstraction. Bot parameter is deprecated and ignored.
+    """
     now = time.time()
     if now - session.last_typing_action < TYPING_ACTION_INTERVAL:
         return
 
-    try:
-        await bot.send_chat_action(
-            chat_id=session.chat_id,
-            message_thread_id=session.thread_id,
-            action=ChatAction.TYPING
-        )
-        session.last_typing_action = now
-    except Exception as e:
-        # Only log if it's not a rate limit (those are expected)
-        if session.logger and "flood" not in str(e).lower():
-            session.logger.log_debug("send_typing_action", f"Failed: {e}")
+    platform = session.get_platform()
+    if platform:
+        try:
+            await platform.send_typing()
+            session.last_typing_action = now
+        except Exception as e:
+            if session.logger and "flood" not in str(e).lower():
+                session.logger.log_debug("send_typing_action", f"Failed: {e}")
 
 
 async def send_diff_images_gallery(
     session: ClaudeSession,
-    bot: Bot,
-    images: list[tuple[BytesIO, str]]
+    bot: Optional[Bot] = None,
+    images: Optional[list[tuple[BytesIO, str]]] = None
 ) -> None:
-    """Send diff images as a media group (gallery)."""
+    """Send diff images as a media group (gallery).
+
+    Uses platform abstraction. Bot parameter is deprecated and ignored.
+    """
     if not images:
         return
 
+    platform = session.get_platform()
+    if not platform:
+        return
+
     try:
-        if len(images) == 1:
-            # Single image - send as photo with caption
-            img_buffer, filename = images[0]
-            await bot.send_photo(
-                chat_id=session.chat_id,
-                message_thread_id=session.thread_id,
-                photo=img_buffer,
-                caption=f"📝 {filename}"
-            )
-        else:
-            # Multiple images - send as media group
-            media = [
-                InputMediaPhoto(
-                    media=img_buffer,
-                    caption=f"📝 {filename}"
-                )
-                for img_buffer, filename in images
-            ]
-            await bot.send_media_group(
-                chat_id=session.chat_id,
-                message_thread_id=session.thread_id,
-                media=media
-            )
+        # Convert to format expected by platform.send_photos
+        # Platform expects (BytesIO, caption) tuples
+        formatted_images = [(img_buffer, f"📝 {filename}") for img_buffer, filename in images]
+        await platform.send_photos(formatted_images)
     except Exception as e:
         if session.logger:
             session.logger.log_error("send_diff_images_gallery", e)
