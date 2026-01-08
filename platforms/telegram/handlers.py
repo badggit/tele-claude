@@ -18,7 +18,7 @@ logger = logging.getLogger("tele-claude.handlers")
 
 from config import GENERAL_TOPIC_ID, ALLOWED_CHATS
 from utils import get_project_folders
-from session import sessions, start_session, send_to_claude, resolve_permission, interrupt_session
+from session import sessions, start_session, start_session_ambient, send_to_claude, resolve_permission, interrupt_session
 from commands import get_command_prompt, get_help_message
 
 
@@ -283,10 +283,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     thread_id = message.message_thread_id
-    if not thread_id or thread_id not in sessions:
+    effective_thread_id = thread_id if thread_id else GENERAL_TOPIC_ID
+
+    # Auto-start ambient session for General topic
+    if effective_thread_id == GENERAL_TOPIC_ID and effective_thread_id not in sessions:
+        logger.info(f"Auto-starting ambient session for General topic (photo) in chat {message.chat_id}")
+        await start_session_ambient(message.chat_id, GENERAL_TOPIC_ID, context.bot)
+
+    if effective_thread_id not in sessions:
         return
 
-    session = sessions[thread_id]
+    session = sessions[effective_thread_id]
 
     # Get largest photo (last in array)
     photo = message.photo[-1]
@@ -302,11 +309,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         prompt = f"{photo_path}\n\n{caption}"
 
         # Interrupt any ongoing query first
-        was_interrupted = await interrupt_session(thread_id)
+        was_interrupted = await interrupt_session(effective_thread_id)
         if was_interrupted:
             await asyncio.sleep(0.1)
 
-        asyncio.create_task(send_to_claude(thread_id, prompt, context.bot))
+        asyncio.create_task(send_to_claude(effective_thread_id, prompt, context.bot))
     else:
         # Image without caption - buffer silently, wait for next text message
         session.pending_image_path = photo_path
@@ -328,9 +335,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text is None:
         return
 
+    # Auto-start ambient session for General topic
+    effective_thread_id = thread_id if thread_id else GENERAL_TOPIC_ID
+    if effective_thread_id == GENERAL_TOPIC_ID and effective_thread_id not in sessions:
+        logger.info(f"Auto-starting ambient session for General topic in chat {message.chat_id}")
+        await start_session_ambient(message.chat_id, GENERAL_TOPIC_ID, context.bot)
+
     # Check if this thread has an active Claude session
-    if thread_id and thread_id in sessions:
-        session = sessions[thread_id]
+    if effective_thread_id in sessions:
+        session = sessions[effective_thread_id]
 
         # Check for slash commands
         prompt = text
@@ -356,16 +369,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             prompt = f"{pending_image}\n\n{prompt}"
 
         # Interrupt any ongoing query first
-        was_interrupted = await interrupt_session(thread_id)
+        was_interrupted = await interrupt_session(effective_thread_id)
         if was_interrupted:
             # Small delay to let interrupt complete
             await asyncio.sleep(0.1)
 
         # Run as background task - don't await!
         # Awaiting would block callback processing (deadlock for permission buttons)
-        asyncio.create_task(send_to_claude(thread_id, prompt, context.bot))
+        asyncio.create_task(send_to_claude(effective_thread_id, prompt, context.bot))
         return
 
-    # Ignore messages in General topic (no echo needed)
-    if thread_id in (None, GENERAL_TOPIC_ID):
-        return
+    # No active session for this thread - silently ignore
+    # (General topic auto-creates session above, other threads need folder selection)

@@ -1,7 +1,7 @@
 """
-MCP tools for Telegram integration.
+MCP tools for platform integration.
 
-Provides custom tools that Claude can use to interact with Telegram,
+Provides custom tools that Claude can use to interact with chat platforms,
 such as sending files to the chat.
 """
 import tempfile
@@ -13,7 +13,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 if TYPE_CHECKING:
     from session import ClaudeSession
 
-# Telegram bot file size limit (50 MB)
+# File size limit - 50 MB (Telegram limit; Discord is 25MB for non-Nitro)
 FILE_SIZE_LIMIT = 50 * 1024 * 1024
 
 
@@ -57,10 +57,10 @@ def validate_file_path(file_path: str, cwd: str) -> tuple[bool, str, Path]:
 
 
 def create_telegram_mcp_server(session: "ClaudeSession"):
-    """Create an MCP server with Telegram tools bound to a session.
+    """Create an MCP server with platform tools bound to a session.
 
-    The server runs in-process and has access to the session's bot,
-    chat_id, and thread_id via closure.
+    The server runs in-process and has access to the session's platform
+    via closure.
 
     Args:
         session: The ClaudeSession to bind tools to
@@ -70,8 +70,8 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
     """
 
     @tool(
-        "send_to_telegram",
-        "Send a file to the Telegram chat. Use this when the user asks you to share a file, "
+        "send_file",
+        "Send a file to the chat. Use this when the user asks you to share a file, "
         "send output as a file, or when a file would be more useful than inline text "
         "(e.g., large outputs, generated images, code files). "
         "The file must exist within the project directory.",
@@ -80,8 +80,8 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
             "caption": str,
         }
     )
-    async def send_to_telegram(args: dict[str, Any]) -> dict[str, Any]:
-        """Send a file to the Telegram chat."""
+    async def send_file(args: dict[str, Any]) -> dict[str, Any]:
+        """Send a file to the chat using the platform abstraction."""
         file_path = args.get("file_path", "")
         caption = args.get("caption", "")
 
@@ -105,40 +105,38 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
         if file_size > FILE_SIZE_LIMIT:
             size_mb = file_size / 1024 / 1024
             return {
-                "content": [{"type": "text", "text": f"Error: File size ({size_mb:.1f} MB) exceeds Telegram's 50 MB limit"}],
+                "content": [{"type": "text", "text": f"Error: File size ({size_mb:.1f} MB) exceeds platform limit"}],
                 "is_error": True
             }
 
-        # Check bot reference
-        if session.bot is None:
+        # Get platform client
+        platform = session.get_platform()
+        if platform is None:
             return {
-                "content": [{"type": "text", "text": "Error: No bot reference available"}],
+                "content": [{"type": "text", "text": "Error: No platform client available"}],
                 "is_error": True
             }
 
         # Log the tool usage
         if session.logger:
-            session.logger.log_tool_call("send_to_telegram", {
+            session.logger.log_tool_call("send_file", {
                 "file_path": str(resolved_path),
                 "caption": caption,
                 "size_bytes": file_size
             })
 
-        # Send the document
+        # Send the document using platform abstraction
         try:
-            message = await session.bot.send_document(
-                chat_id=session.chat_id,
-                message_thread_id=session.thread_id,
-                document=resolved_path,
+            result = await platform.send_document(
+                path=str(resolved_path),
                 caption=caption if caption else None,
-                filename=resolved_path.name
             )
 
             # Log success
             if session.logger:
                 session.logger.log_tool_result(
-                    "send_to_telegram",
-                    f"Sent {resolved_path.name} (message_id={message.message_id})",
+                    "send_file",
+                    f"Sent {resolved_path.name}",
                     success=True
                 )
 
@@ -153,8 +151,8 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
             error_text = f"Failed to send file: {str(e)}"
 
             if session.logger:
-                session.logger.log_tool_result("send_to_telegram", error_text, success=False)
-                session.logger.log_error("send_to_telegram", e)
+                session.logger.log_tool_result("send_file", error_text, success=False)
+                session.logger.log_error("send_file", e)
 
             return {
                 "content": [{"type": "text", "text": f"Error: {error_text}"}],
@@ -162,7 +160,7 @@ def create_telegram_mcp_server(session: "ClaudeSession"):
             }
 
     return create_sdk_mcp_server(
-        name="telegram-tools",
+        name="chat-tools",
         version="1.0.0",
-        tools=[send_to_telegram]
+        tools=[send_file]
     )

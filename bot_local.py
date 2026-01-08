@@ -35,7 +35,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
-from handlers import handle_callback, handle_message, handle_photo, handle_help, is_authorized_chat
+from platforms.telegram.handlers import handle_callback, handle_message, handle_photo, handle_help, is_authorized_chat
 from session import start_session_local, sessions
 from logger import setup_logging
 
