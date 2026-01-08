@@ -8,13 +8,22 @@ import asyncio
 import re
 import time
 from io import BytesIO
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
 from telegram import Bot, InputMediaPhoto, Message
 from telegram.constants import ChatAction
 
 from ..protocol import ButtonRow, ButtonSpec, MessageRef, PlatformClient
 from .formatter import TelegramFormatter, markdown_to_html, split_text, strip_html_tags
+
+
+@runtime_checkable
+class ErrorLogger(Protocol):
+    """Protocol for error logging capability."""
+
+    def log_error(self, context: str, error: Exception) -> None:
+        """Log an error with context."""
+        ...
 
 # Rate limiting constants
 MIN_SEND_INTERVAL = 1.0  # Minimum seconds between messages
@@ -37,7 +46,7 @@ class TelegramClient(PlatformClient):
         bot: Bot,
         chat_id: int,
         thread_id: int,
-        logger: Optional[object] = None,
+        logger: Optional[ErrorLogger] = None,
     ):
         """Initialize Telegram client.
 
@@ -105,7 +114,7 @@ class TelegramClient(PlatformClient):
 
     def _log_error(self, context: str, error: Exception) -> None:
         """Log error if logger is available."""
-        if self._logger and hasattr(self._logger, 'log_error'):
+        if self._logger:
             self._logger.log_error(context, error)
 
     async def send_message(

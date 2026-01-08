@@ -79,21 +79,25 @@ platforms/telegram/client.py   OR   platforms/discord/client.py
 
 ## Current Status
 
-**Phase:** 2b (In progress - session refactor partial)
-**Last action:** Integrated platform abstraction into session.py
-**Next step:** Continue session.py refactor (send_message, send_or_edit_response)
+**Phase:** 2 COMPLETE ✓
+**Last action:** Full session.py migration to platform abstraction
+**Next step:** Phase 3 - Move handlers.py and bot.py to platforms/telegram/
 
 ### Completed
 - [x] Phase 1: Protocol definitions (PlatformClient, MessageFormatter, etc.)
-- [x] Phase 2a: TelegramClient and TelegramFormatter extracted
-- [x] Phase 2b partial:
+- [x] Phase 2: Telegram client extraction + session.py refactor
+  - [x] TelegramClient and TelegramFormatter extracted
   - [x] ClaudeSession updated with platform/formatter fields
   - [x] request_tool_permission uses platform
   - [x] pre_compact_hook uses platform
   - [x] send_typing_action uses platform
   - [x] send_diff_images_gallery uses platform
-  - [ ] send_message needs platform (still uses bot)
-  - [ ] send_or_edit_response needs platform (still uses bot)
+  - [x] send_message returns MessageRef, uses platform
+  - [x] send_or_edit_response uses MessageRef, platform
+  - [x] _send_with_fallback uses platform
+  - [x] send_to_claude streaming loop uses MessageRef throughout
+  - [x] Tests updated and passing (59/59)
+  - [x] Pyright clean (0 errors)
 
 ---
 

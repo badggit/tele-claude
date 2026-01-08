@@ -488,10 +488,18 @@ async def stop_session(thread_id: int) -> bool:
     return True
 
 
-async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
-    """Send a message to Claude and stream the response to Telegram."""
+async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None) -> None:
+    """Send a message to Claude and stream the response.
+
+    Uses platform abstraction for cross-platform support.
+    Bot parameter is deprecated and ignored.
+    """
     session = sessions.get(thread_id)
     if not session or not session.active:
+        return
+
+    platform = session.get_platform()
+    if not platform:
         return
 
     # Log user input
@@ -499,17 +507,17 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
         session.logger.log_user_input(prompt)
 
     # Send typing indicator
-    await send_typing_action(session, bot)
+    await send_typing_action(session)
 
     # Track current response message for streaming edits
-    response_msg: Optional[Message] = None
+    response_ref: Optional[MessageRef] = None
     response_text = ""
-    response_msg_text_len = 0  # Length of text in current response_msg
+    response_msg_text_len = 0  # Length of text in current response_ref
 
     # Buffer for batching consecutive tool calls of same type
     tool_buffer: list[tuple[str, dict]] = []  # [(tool_name, input), ...]
     tool_buffer_name: Optional[str] = None  # Current tool type being buffered
-    tool_buffer_msg: Optional[Message] = None  # Message being edited for batch
+    tool_buffer_ref: Optional[MessageRef] = None  # Message being edited for batch
 
     # Buffer for diff images to send as media group at end
     diff_images: list[tuple[BytesIO, str]] = []  # [(image_buffer, filename), ...]
@@ -528,31 +536,26 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
 
     async def update_tool_buffer_message():
         """Send or edit the tool buffer message."""
-        nonlocal tool_buffer_msg
+        nonlocal tool_buffer_ref
         text = format_current_tool_buffer()
 
-        if tool_buffer_msg:
+        if tool_buffer_ref and tool_buffer_ref.platform_data:
             # Edit existing message
             try:
-                await bot.edit_message_text(
-                    chat_id=session.chat_id,
-                    message_id=tool_buffer_msg.message_id,
-                    text=text,
-                    parse_mode="HTML"
-                )
+                await platform.edit_message(tool_buffer_ref, text)
             except Exception as e:
                 if session.logger and "message is not modified" not in str(e).lower():
                     session.logger.log_error("update_tool_buffer_message", e)
         else:
             # Send new message
-            tool_buffer_msg = await send_message(session, bot, text, parse_mode="HTML")
+            tool_buffer_ref = await send_message(session, text=text)
 
     async def flush_tool_buffer():
         """Clear tool buffer state (message already sent/edited)."""
-        nonlocal tool_buffer, tool_buffer_name, tool_buffer_msg
+        nonlocal tool_buffer, tool_buffer_name, tool_buffer_ref
         tool_buffer = []
         tool_buffer_name = None
-        tool_buffer_msg = None
+        tool_buffer_ref = None
 
     try:
         # Check if AGENTS.md exists and pre-load its content into system prompt
@@ -621,7 +624,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             await client.query(prompt_stream())
             async for message in client.receive_response():
                 # Refresh typing indicator on each message
-                await send_typing_action(session, bot)
+                await send_typing_action(session)
 
                 # Log SDK message
                 if session.logger:
@@ -637,17 +640,17 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                                 await flush_tool_buffer()
 
                                 response_text += block.text
-                                response_msg, response_msg_text_len = await send_or_edit_response(
-                                    session, bot, response_msg, response_text, response_msg_text_len
+                                response_ref, response_msg_text_len = await send_or_edit_response(
+                                    session, existing_ref=response_ref, text=response_text, msg_text_len=response_msg_text_len
                                 )
 
                             elif isinstance(block, ToolUseBlock):
                                 # Tool use block - buffer it
                                 if response_text.strip():
-                                    response_msg, response_msg_text_len = await send_or_edit_response(
-                                        session, bot, response_msg, response_text, response_msg_text_len
+                                    response_ref, response_msg_text_len = await send_or_edit_response(
+                                        session, existing_ref=response_ref, text=response_text, msg_text_len=response_msg_text_len
                                     )
-                                    response_msg = None
+                                    response_ref = None
                                     response_text = ""
                                     response_msg_text_len = 0
 
@@ -700,11 +703,12 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                         output = format_tool_output(content)
                         if output:
                             # Escape HTML entities in output
-                            safe_output = escape_html(output)
-                            await send_message(session, bot, f"<pre>{safe_output}</pre>", parse_mode="HTML")
+                            formatter = session.get_formatter()
+                            safe_output = formatter.escape_text(output)
+                            await send_message(session, text=formatter.code_block(safe_output))
 
                         # Refresh typing - more content likely coming after tool result
-                        await send_typing_action(session, bot)
+                        await send_typing_action(session)
 
                 # Capture model from AssistantMessage
                 if isinstance(message, AssistantMessage):
@@ -724,12 +728,12 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
 
             # Flush any remaining buffers (inside async with, after loop)
             await flush_tool_buffer()
-            if response_text.strip() and response_msg is None:
-                await send_message(session, bot, response_text)
+            if response_text.strip() and response_ref is None:
+                await send_message(session, text=response_text)
 
             # Send diff images as media group (gallery)
             if diff_images:
-                await send_diff_images_gallery(session, bot, diff_images)
+                await send_diff_images_gallery(session, images=diff_images)
 
             # Calculate and store context remaining
             if last_usage:
@@ -743,29 +747,23 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                             session.logger._write_log(f"CONTEXT WARNING: {context_remaining:.1f}% remaining")
 
                         warning = f"\n\n⚠️ {context_remaining:.0f}% context remaining"
+                        max_len = platform.max_message_length
 
                         # Only append to text response message (not tool messages)
-                        if response_msg and response_msg_text_len > 0:
+                        if response_ref and response_ref.platform_data and response_msg_text_len > 0:
                             # Check if warning fits in current message
-                            if response_msg_text_len + len(warning) <= 4000:
+                            if response_msg_text_len + len(warning) <= max_len:
                                 # Get the text currently in the message and append warning
-                                # Use the portion of response_text that's in this message
                                 current_msg_text = response_text[-response_msg_text_len:] if len(response_text) > response_msg_text_len else response_text
                                 warning_text = current_msg_text + warning
                                 try:
-                                    html_text = markdown_to_html(warning_text)
-                                    await bot.edit_message_text(
-                                        chat_id=session.chat_id,
-                                        message_id=response_msg.message_id,
-                                        text=html_text,
-                                        parse_mode="HTML"
-                                    )
+                                    await platform.edit_message(response_ref, warning_text)
                                 except Exception:
                                     # Edit failed, send as separate message
-                                    await send_message(session, bot, f"⚠️ {context_remaining:.0f}% context remaining")
+                                    await send_message(session, text=f"⚠️ {context_remaining:.0f}% context remaining")
                             else:
                                 # Warning doesn't fit, send separately
-                                await send_message(session, bot, f"⚠️ {context_remaining:.0f}% context remaining")
+                                await send_message(session, text=f"⚠️ {context_remaining:.0f}% context remaining")
 
             # Clear client reference when done
             session.client = None
@@ -779,10 +777,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
         error_msg = f"❌ Error: {str(e)}"
         if e.stderr:
             error_msg += f"\nStderr: {e.stderr[:500]}"
-        await send_message(session, bot, error_msg)
+        await send_message(session, text=error_msg)
     except Exception as e:
         error_msg = f"❌ Error: {str(e)}"
-        await send_message(session, bot, error_msg)
+        await send_message(session, text=error_msg)
         if session.logger:
             session.logger.log_error("send_to_claude", e)
     finally:
@@ -792,199 +790,128 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
 
 async def send_or_edit_response(
     session: ClaudeSession,
-    bot: Bot,
-    existing_msg: Optional[Message],
-    text: str,
+    bot: Optional[Bot] = None,
+    existing_ref: Optional[MessageRef] = None,
+    text: str = "",
     msg_text_len: int = 0
-) -> tuple[Optional[Message], int]:
+) -> tuple[Optional[MessageRef], int]:
     """Send a new response message or edit an existing one.
 
-    Handles overflow by starting new messages when text exceeds 4000 chars.
+    Handles overflow by starting new messages when text exceeds platform limit.
     Splits long responses into multiple messages to avoid truncation.
 
     Args:
         session: The Claude session
-        bot: Telegram bot instance
-        existing_msg: Existing message to edit, or None to send new
+        bot: Deprecated, ignored - uses session.get_platform()
+        existing_ref: Existing message ref to edit, or None to send new
         text: Full accumulated text to display
-        msg_text_len: Length of text already in existing_msg (for overflow detection)
+        msg_text_len: Length of text already in existing_ref (for overflow detection)
 
     Returns:
-        Tuple of (last message sent, length of text in that message)
+        Tuple of (last message ref, length of text in that message)
     """
     if not text.strip():
-        return existing_msg, msg_text_len
+        return existing_ref, msg_text_len
+
+    platform = session.get_platform()
+    max_len = platform.max_message_length if platform else 4000
 
     # Check if we need to overflow to new messages
-    if len(text) > 4000 and existing_msg and msg_text_len > 0:
+    if len(text) > max_len and existing_ref and msg_text_len > 0:
         # Current message is full, send overflow text as new message(s)
         overflow_text = text[msg_text_len:]
 
         # Split overflow into chunks and send each as a new message
-        chunks = split_text(overflow_text, 4000)
-        last_msg: Optional[Message] = None
+        chunks = split_text(overflow_text, max_len)
+        last_ref: Optional[MessageRef] = None
         last_len = 0
 
         for chunk in chunks:
-            new_msg = await _send_with_fallback(session, bot, chunk, existing_msg=None)
-            if new_msg:
-                last_msg = new_msg
+            new_ref = await _send_with_fallback(session, text=chunk, existing_ref=None)
+            if new_ref:
+                last_ref = new_ref
                 last_len = len(chunk)
 
-        return last_msg if last_msg else existing_msg, last_len if last_msg else msg_text_len
+        return last_ref if last_ref else existing_ref, last_len if last_ref else msg_text_len
 
     # Text fits in one message - edit existing or send new
     display_text = text
-    if len(display_text) > 4000:
-        display_text = display_text[:3990] + "\n..."
+    if len(display_text) > max_len:
+        display_text = display_text[:max_len - 10] + "\n..."
 
-    result_msg = await _send_with_fallback(session, bot, display_text, existing_msg=existing_msg)
-    if result_msg:
-        return result_msg, len(display_text)
-    return existing_msg, msg_text_len
+    result_ref = await _send_with_fallback(session, text=display_text, existing_ref=existing_ref)
+    if result_ref:
+        return result_ref, len(display_text)
+    return existing_ref, msg_text_len
 
 
 async def _send_with_fallback(
     session: ClaudeSession,
-    bot: Bot,
-    text: str,
-    existing_msg: Optional[Message] = None,
+    bot: Optional[Bot] = None,
+    text: str = "",
+    existing_ref: Optional[MessageRef] = None,
     max_retries: int = 3
-) -> Optional[Message]:
-    """Send or edit a message with multiple fallback strategies.
+) -> Optional[MessageRef]:
+    """Send or edit a message using platform abstraction.
 
-    Fallback order:
-    1. Try HTML formatted message
-    2. If HTML fails, try plain text (stripped of HTML tags)
-    3. If still failing (e.g., flood control), retry with exponential backoff
+    Platform client handles retries and fallbacks internally.
 
     Args:
         session: The Claude session
-        bot: Telegram bot instance
-        text: Text to send (markdown format)
-        existing_msg: Existing message to edit, or None to send new
-        max_retries: Maximum retry attempts for transient errors
+        bot: Deprecated, ignored - uses session.get_platform()
+        text: Text to send (markdown format, will be converted)
+        existing_ref: Existing message ref to edit, or None to send new
+        max_retries: Retry attempts (handled by platform)
 
     Returns:
-        Message object if successful, None otherwise
+        MessageRef if successful, None otherwise
     """
-    # Strategy 1: Try with HTML formatting
-    html_text = markdown_to_html(text)
+    platform = session.get_platform()
+    if not platform:
+        return None
 
-    for attempt in range(max_retries):
-        try:
-            if existing_msg:
-                await bot.edit_message_text(
-                    chat_id=session.chat_id,
-                    message_id=existing_msg.message_id,
-                    text=html_text,
-                    parse_mode="HTML"
-                )
-                return existing_msg
-            else:
-                return await bot.send_message(
-                    chat_id=session.chat_id,
-                    message_thread_id=session.thread_id,
-                    text=html_text,
-                    parse_mode="HTML"
-                )
-        except Exception as e:
-            error_str = str(e).lower()
-
-            # Skip logging for "message not modified" - not an error
-            if "message is not modified" in error_str:
-                return existing_msg
-
-            if session.logger:
-                session.logger.log_error("send_with_fallback_html", e)
-
-            # Strategy 2: If HTML parsing failed, try plain text
-            if "parse entities" in error_str or "can't parse" in error_str:
-                plain_text = strip_html_tags(html_text)
-                try:
-                    if existing_msg:
-                        await bot.edit_message_text(
-                            chat_id=session.chat_id,
-                            message_id=existing_msg.message_id,
-                            text=plain_text
-                        )
-                        return existing_msg
-                    else:
-                        return await bot.send_message(
-                            chat_id=session.chat_id,
-                            message_thread_id=session.thread_id,
-                            text=plain_text
-                        )
-                except Exception as plain_err:
-                    if session.logger:
-                        session.logger.log_error("send_with_fallback_plain", plain_err)
-                    error_str = str(plain_err).lower()
-
-            # Strategy 3: Retry with backoff for transient errors
-            if "flood control" in error_str or "retry" in error_str or "timed out" in error_str:
-                # Extract retry time if available, otherwise use exponential backoff
-                wait_time = 2 ** attempt  # 1, 2, 4 seconds
-                if "retry in" in error_str:
-                    try:
-                        # Try to extract the retry time from error message
-                        import re
-                        match = re.search(r'retry in (\d+)', error_str)
-                        if match:
-                            wait_time = min(int(match.group(1)), 30)  # Cap at 30 seconds
-                    except Exception:
-                        pass
-
-                if attempt < max_retries - 1:
-                    if session.logger:
-                        session.logger.log_debug("send_with_fallback", f"Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(wait_time)
-                    continue
-
-            # Non-retryable error or max retries exceeded
-            break
-
-    return None
+    try:
+        if existing_ref and existing_ref.platform_data:
+            await platform.edit_message(existing_ref, text)
+            return existing_ref
+        else:
+            return await platform.send_message(text)
+    except Exception as e:
+        error_str = str(e).lower()
+        # "message is not modified" is not an error
+        if "message is not modified" in error_str:
+            return existing_ref
+        if session.logger:
+            session.logger.log_error("_send_with_fallback", e)
+        return None
 
 
 async def send_message(
     session: ClaudeSession,
-    bot: Bot,
-    text: str,
+    bot: Optional[Bot] = None,
+    text: str = "",
     parse_mode: Optional[str] = None
-) -> Optional[Message]:
-    """Send a new Telegram message with rate limiting."""
+) -> Optional[MessageRef]:
+    """Send a new message using platform abstraction.
+
+    Args:
+        session: The Claude session
+        bot: Deprecated, ignored - uses session.get_platform()
+        text: Text to send (will be converted to platform format)
+        parse_mode: Deprecated, ignored - platform handles formatting
+
+    Returns:
+        MessageRef for later editing, or None if send failed
+    """
     if not text.strip():
         return None
 
-    # Rate limiting
-    now = time.time()
-    elapsed = now - session.last_send
-    if elapsed < session.send_interval:
-        await asyncio.sleep(session.send_interval - elapsed)
+    platform = session.get_platform()
+    if not platform:
+        return None
 
-    # Split if too long
-    chunks = split_text(text, 4000)
-
-    msg = None
-    for chunk in chunks:
-        try:
-            msg = await bot.send_message(
-                chat_id=session.chat_id,
-                message_thread_id=session.thread_id,
-                text=chunk,
-                parse_mode=parse_mode
-            )
-            # Reset interval on success
-            session.send_interval = MIN_SEND_INTERVAL
-            session.last_send = time.time()
-        except Exception as e:
-            if "flood control" in str(e).lower():
-                # Back off on rate limit
-                session.send_interval = min(session.send_interval * 2, 30.0)
-            if session.logger:
-                session.logger.log_error("send_message", e)
-
-    return msg
+    # Platform client handles rate limiting internally
+    return await platform.send_message(text)
 
 
 async def send_typing_action(session: ClaudeSession, bot: Optional[Bot] = None) -> None:
