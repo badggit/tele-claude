@@ -1,13 +1,16 @@
 # AGENTS.md
 
 ## Project Overview
-Telegram bot bridging forum topics to Claude Agent SDK sessions. Each topic = one Claude session.
+Multi-platform bot bridging Telegram/Discord to Claude Agent SDK sessions. Each topic/thread = one Claude session.
 
 ## Architecture
-- `bot.py` - Telegram bot setup, handlers registration
+- `main.py` - Unified CLI entry point (`telegram`, `telegram --local`, `discord`)
+- `platforms/telegram/runner.py` - Telegram bot runners (global and local modes)
+- `platforms/telegram/handlers.py` - Telegram message/callback handlers
+- `platforms/discord/runner.py` - Discord bot runner
+- `platforms/discord/handlers.py` - Discord message handlers
 - `session.py` - Claude SDK integration, message streaming, tool permissions
-- `handlers.py` - Telegram message/callback handlers
-- `config.py` - Environment config (BOT_TOKEN, PROJECTS_DIR)
+- `config.py` - Environment config (BOT_TOKEN, PROJECTS_DIR, browser settings)
 - `logger.py` - Session logging
 - `diff_image.py` - Syntax-highlighted edit diffs
 
@@ -24,6 +27,7 @@ Telegram bot bridging forum topics to Claude Agent SDK sessions. Each topic = on
 
 ## Dependencies
 - python-telegram-bot (async)
+- discord.py (async)
 - claude-agent-sdk
 - mistune (markdown to HTML)
 - Pillow (diff images)
