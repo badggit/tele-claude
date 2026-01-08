@@ -777,19 +777,19 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                                 # Interleaved thinking - flush any pending content first
                                 await flush_tool_buffer()
                                 if response_text.strip():
-                                    response_msg, response_msg_text_len = await send_or_edit_response(
-                                        session, bot, response_msg, response_text, response_msg_text_len
+                                    response_ref, response_msg_text_len = await send_or_edit_response(
+                                        session, existing_ref=response_ref, text=response_text, msg_text_len=response_msg_text_len
                                     )
-                                    response_msg = None
+                                    response_ref = None
                                     response_text = ""
                                     response_msg_text_len = 0
 
                                 # Send thinking content with brain emoji
                                 thinking_text = block.thinking
                                 if thinking_text:
-                                    # Escape HTML and format as italic with brain emoji
-                                    safe_thinking = escape_html(thinking_text)
-                                    await send_message(session, bot, f"🧠 <i>{safe_thinking}</i>", parse_mode="HTML")
+                                    formatter = session.get_formatter()
+                                    safe_thinking = formatter.escape_text(thinking_text)
+                                    await send_message(session, text=f"🧠 {formatter.italic(safe_thinking)}")
 
                     elif isinstance(content, str) and content:
                         # Tool result - flush tool buffer first
