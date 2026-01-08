@@ -79,9 +79,9 @@ platforms/telegram/client.py   OR   platforms/discord/client.py
 
 ## Current Status
 
-**Phase:** 2 COMPLETE ✓
-**Last action:** Full session.py migration to platform abstraction
-**Next step:** Phase 3 - Move handlers.py and bot.py to platforms/telegram/
+**Phase:** 3 COMPLETE ✓
+**Last action:** Moved handlers.py to platforms/telegram/handlers.py
+**Next step:** Phase 4 - Implement Discord platform
 
 ### Completed
 - [x] Phase 1: Protocol definitions (PlatformClient, MessageFormatter, etc.)
@@ -98,6 +98,10 @@ platforms/telegram/client.py   OR   platforms/discord/client.py
   - [x] send_to_claude streaming loop uses MessageRef throughout
   - [x] Tests updated and passing (59/59)
   - [x] Pyright clean (0 errors)
+- [x] Phase 3: Handlers reorganization
+  - [x] handlers.py moved to platforms/telegram/handlers.py
+  - [x] bot.py and bot_local.py updated to use new import path
+  - [x] Tests passing, pyright clean
 
 ---
 

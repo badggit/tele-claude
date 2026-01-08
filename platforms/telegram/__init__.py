@@ -1,4 +1,8 @@
-"""Telegram platform implementation."""
+"""Telegram platform implementation.
+
+Handlers are NOT exported here to avoid circular imports.
+Import directly: from platforms.telegram.handlers import ...
+"""
 
 from .client import TelegramClient
 from .formatter import (

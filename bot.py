@@ -4,7 +4,10 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
 from config import BOT_TOKEN
-from handlers import handle_new_topic, handle_callback, handle_message, handle_topic_created, handle_photo, handle_help
+from platforms.telegram.handlers import (
+    handle_new_topic, handle_callback, handle_message,
+    handle_topic_created, handle_photo, handle_help
+)
 from logger import setup_logging
 
 # Configure logging - silent console, full file logging
