@@ -79,9 +79,21 @@ platforms/telegram/client.py   OR   platforms/discord/client.py
 
 ## Current Status
 
-**Phase:** 1 (Not started)
-**Last action:** Created branch and documentation
-**Next step:** Create platforms/protocol.py
+**Phase:** 2b (In progress - session refactor partial)
+**Last action:** Integrated platform abstraction into session.py
+**Next step:** Continue session.py refactor (send_message, send_or_edit_response)
+
+### Completed
+- [x] Phase 1: Protocol definitions (PlatformClient, MessageFormatter, etc.)
+- [x] Phase 2a: TelegramClient and TelegramFormatter extracted
+- [x] Phase 2b partial:
+  - [x] ClaudeSession updated with platform/formatter fields
+  - [x] request_tool_permission uses platform
+  - [x] pre_compact_hook uses platform
+  - [x] send_typing_action uses platform
+  - [x] send_diff_images_gallery uses platform
+  - [ ] send_message needs platform (still uses bot)
+  - [ ] send_or_edit_response needs platform (still uses bot)
 
 ---
 
