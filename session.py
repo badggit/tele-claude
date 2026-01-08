@@ -38,10 +38,9 @@ from browser_tools import create_browser_mcp_server, BrowserSession
 from platforms import PlatformClient, MessageFormatter, ButtonSpec, ButtonRow, MessageRef
 from platforms.telegram import TelegramClient, TelegramFormatter
 
-# Optional Discord imports (only needed when running Discord bot)
+# Check if Discord support is available
 try:
     import discord
-    from platforms.discord import DiscordClient, DiscordFormatter
     DISCORD_AVAILABLE = True
 except ImportError:
     DISCORD_AVAILABLE = False
