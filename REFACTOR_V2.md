@@ -79,9 +79,9 @@ platforms/telegram/client.py   OR   platforms/discord/client.py
 
 ## Current Status
 
-**Phase:** 3 COMPLETE ✓
-**Last action:** Moved handlers.py to platforms/telegram/handlers.py
-**Next step:** Phase 4 - Implement Discord platform
+**Phase:** 4 COMPLETE ✓
+**Last action:** Implemented Discord platform support
+**Next step:** Phase 5 - Update MCP tools for platform abstraction
 
 ### Completed
 - [x] Phase 1: Protocol definitions (PlatformClient, MessageFormatter, etc.)
@@ -101,6 +101,14 @@ platforms/telegram/client.py   OR   platforms/discord/client.py
 - [x] Phase 3: Handlers reorganization
   - [x] handlers.py moved to platforms/telegram/handlers.py
   - [x] bot.py and bot_local.py updated to use new import path
+  - [x] Tests passing, pyright clean
+- [x] Phase 4: Discord platform implementation
+  - [x] platforms/discord/client.py (DiscordClient)
+  - [x] platforms/discord/formatter.py (DiscordFormatter - markdown)
+  - [x] platforms/discord/handlers.py (message, attachment, interaction handlers)
+  - [x] run_discord.py entry point
+  - [x] Discord config in config.py (DISCORD_BOT_TOKEN, channel->project mapping)
+  - [x] start_session_discord in session.py
   - [x] Tests passing, pyright clean
 
 ---

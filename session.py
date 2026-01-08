@@ -38,6 +38,14 @@ from browser_tools import create_browser_mcp_server, BrowserSession
 from platforms import PlatformClient, MessageFormatter, ButtonSpec, ButtonRow, MessageRef
 from platforms.telegram import TelegramClient, TelegramFormatter
 
+# Optional Discord imports (only needed when running Discord bot)
+try:
+    import discord
+    from platforms.discord import DiscordClient, DiscordFormatter
+    DISCORD_AVAILABLE = True
+except ImportError:
+    DISCORD_AVAILABLE = False
+
 # Module logger (named _log to avoid collision with SessionLogger variables named 'logger')
 _log = logging.getLogger("tele-claude.session")
 
@@ -426,7 +434,7 @@ async def _start_session_impl(
     bot: Bot,
     logs_dir: Optional[Path] = None
 ) -> bool:
-    """Internal: start session with given cwd path."""
+    """Internal: start Telegram session with given cwd path."""
     # Create logger (use custom logs_dir if provided)
     logger = SessionLogger(thread_id, chat_id, cwd, logs_dir)
 
@@ -459,6 +467,58 @@ async def _start_session_impl(
 
     # Send welcome message using platform
     await platform.send_message(f"Claude session started in {formatter.code(display_name)}")
+
+    return True
+
+
+async def start_session_discord(channel_id: int, project_path: str, channel: Any) -> bool:
+    """Start a new Claude session for a Discord channel.
+
+    Args:
+        channel_id: Discord channel ID (used as session key)
+        project_path: Absolute path to project directory
+        channel: Discord channel object (TextChannel or similar)
+
+    Returns:
+        True if session started successfully
+    """
+    if not DISCORD_AVAILABLE:
+        _log.error("Discord support not available - discord.py not installed")
+        return False
+
+    cwd_path = Path(project_path)
+    if not cwd_path.exists():
+        return False
+
+    display_name = cwd_path.name
+
+    # Create logger - use project-local logs
+    logs_dir = cwd_path / ".bot-logs"
+    logger = SessionLogger(channel_id, 0, str(cwd_path), logs_dir)  # chat_id=0 for Discord
+
+    # Load contextual commands
+    contextual_commands = load_contextual_commands(str(cwd_path))
+
+    # Create Discord platform client and formatter
+    # Import here to avoid issues when discord.py not installed
+    from platforms.discord import DiscordClient as DC, DiscordFormatter as DF
+    platform = DC(channel=channel, logger=logger)
+    formatter = DF()
+
+    # Store session (keyed by channel_id for Discord)
+    sessions[channel_id] = ClaudeSession(
+        chat_id=0,  # Not used for Discord
+        thread_id=channel_id,  # Use channel_id as session key
+        cwd=str(cwd_path),
+        platform=platform,
+        formatter=formatter,
+        bot=None,  # No Telegram bot
+        logger=logger,
+        contextual_commands=contextual_commands,
+    )
+
+    # Send welcome message
+    await platform.send_message(f"Claude session started in `{display_name}`")
 
     return True
 
