@@ -22,7 +22,7 @@ from telegram.constants import ChatAction
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ProcessError, PermissionResultAllow, PermissionResultDeny, HookMatcher, HookContext
 from claude_agent_sdk.types import (
     SystemPromptPreset, ToolPermissionContext, HookInput, HookJSONOutput,
-    UserMessage, AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+    UserMessage, AssistantMessage, ResultMessage, TextBlock, ToolUseBlock, ThinkingBlock
 )
 
 from config import PROJECTS_DIR
@@ -546,6 +546,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             resume=session.session_id,  # Resume previous conversation if exists
             system_prompt=system_prompt,
             setting_sources=["user", "project"],  # Load skills from ~/.claude/skills/ and .claude/skills/
+            max_thinking_tokens=10000,  # Enable interleaved thinking between tool calls
             mcp_servers={
                 "telegram-tools": telegram_mcp,
                 "browser-tools": browser_mcp,
@@ -631,6 +632,24 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                                     if img_buffer:
                                         filename = file_path.split("/")[-1] if "/" in file_path else file_path
                                         diff_images.append((img_buffer, filename))
+
+                            elif isinstance(block, ThinkingBlock):
+                                # Interleaved thinking - flush any pending content first
+                                await flush_tool_buffer()
+                                if response_text.strip():
+                                    response_msg, response_msg_text_len = await send_or_edit_response(
+                                        session, bot, response_msg, response_text, response_msg_text_len
+                                    )
+                                    response_msg = None
+                                    response_text = ""
+                                    response_msg_text_len = 0
+
+                                # Send thinking content with brain emoji
+                                thinking_text = block.thinking
+                                if thinking_text:
+                                    # Escape HTML and format as italic with brain emoji
+                                    safe_thinking = escape_html(thinking_text)
+                                    await send_message(session, bot, f"🧠 <i>{safe_thinking}</i>", parse_mode="HTML")
 
                     elif isinstance(content, str) and content:
                         # Tool result - flush tool buffer first
