@@ -175,16 +175,16 @@ class TelegramClient(PlatformClient):
         *,
         buttons: Optional[list[ButtonRow]] = None,
     ) -> None:
-        """Edit an existing message."""
+        """Edit an existing message.
+
+        Note: Caller (session.py send_or_edit_response) handles overflow/truncation.
+        Text should already be within max_message_length when this is called.
+        """
         msg: Optional[Message] = ref.platform_data
         if not msg:
             return
 
         html_text = markdown_to_html(text)
-        # Truncate if too long
-        if len(html_text) > self.max_message_length:
-            html_text = html_text[:self.max_message_length - 10] + "\n..."
-
         keyboard = self._build_keyboard(buttons)
 
         try:

@@ -245,6 +245,76 @@ class TestSendOrEditResponse:
         )
         assert result_len == len(text)
 
+    @pytest.mark.asyncio
+    async def test_new_message_over_max_sends_full_text(self, mock_session, mock_platform):
+        """New message over max_len should send full text to send_message (not pre-truncate)."""
+        text = "a" * 5000
+        new_ref = MessageRef(platform_data=MagicMock())
+        mock_platform.send_message.return_value = new_ref
+
+        await send_or_edit_response(
+            mock_session, existing_ref=None, text=text, msg_text_len=0
+        )
+
+        # send_message should receive full text (it handles splitting via split_text)
+        mock_platform.send_message.assert_called_once()
+        call_args = mock_platform.send_message.call_args
+        sent_text = call_args[0][0] if call_args[0] else call_args[1].get('text', '')
+        assert len(sent_text) == 5000  # Full text, not truncated
+
+    @pytest.mark.asyncio
+    async def test_edit_existing_over_max_truncates(self, mock_session, mock_platform, mock_message_ref):
+        """Editing existing message over max_len should truncate (can't split an edit)."""
+        text = "a" * 5000
+
+        result_ref, result_len = await send_or_edit_response(
+            mock_session, existing_ref=mock_message_ref, text=text, msg_text_len=0
+        )
+
+        # edit_message should receive truncated text
+        mock_platform.edit_message.assert_called_once()
+        call_args = mock_platform.edit_message.call_args
+        sent_text = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get('text', '')
+        assert len(sent_text) < 5000  # Truncated
+        assert sent_text.endswith("...")  # Has truncation marker
+
+    @pytest.mark.asyncio
+    async def test_discord_2000_char_limit(self, mock_session):
+        """Test with Discord's 2000 char limit."""
+        # Create mock platform with Discord's limit
+        mock_platform = MagicMock()
+        mock_platform.max_message_length = 2000
+        mock_session.get_platform.return_value = mock_platform
+
+        text = "a" * 2500
+        existing_ref = MessageRef(platform_data=MagicMock())
+
+        await send_or_edit_response(
+            mock_session, existing_ref=existing_ref, text=text, msg_text_len=0
+        )
+
+        # Should truncate to ~1990 chars
+        call_args = mock_platform.edit_message.call_args
+        sent_text = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get('text', '')
+        assert len(sent_text) <= 2000
+        assert sent_text.endswith("...")
+
+    @pytest.mark.asyncio
+    async def test_message_ref_without_platform_data_sends_new(self, mock_session, mock_platform):
+        """MessageRef with platform_data=None should send new message, not edit."""
+        text = "a" * 5000
+        empty_ref = MessageRef(platform_data=None)
+        new_ref = MessageRef(platform_data=MagicMock())
+        mock_platform.send_message.return_value = new_ref
+
+        await send_or_edit_response(
+            mock_session, existing_ref=empty_ref, text=text, msg_text_len=0
+        )
+
+        # Should call send_message (not edit_message) since platform_data is None
+        mock_platform.send_message.assert_called_once()
+        mock_platform.edit_message.assert_not_called()
+
 
 class TestWarningAppendLogic:
     """Tests for context warning append behavior."""

@@ -134,14 +134,14 @@ class DiscordClient(PlatformClient):
         *,
         buttons: Optional[list[ButtonRow]] = None,
     ) -> None:
-        """Edit an existing message."""
+        """Edit an existing message.
+
+        Note: Caller (session.py send_or_edit_response) handles overflow/truncation.
+        Text should already be within max_message_length when this is called.
+        """
         msg: Optional[discord.Message] = ref.platform_data
         if not msg:
             return
-
-        # Truncate if too long
-        if len(text) > self.max_message_length:
-            text = text[:self.max_message_length - 10] + "\n..."
 
         view = self._build_view(buttons)
 

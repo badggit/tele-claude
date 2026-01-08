@@ -929,14 +929,15 @@ async def send_or_edit_response(
 
         return last_ref if last_ref else existing_ref, last_len if last_ref else msg_text_len
 
-    # Text fits in one message - edit existing or send new
+    # For edits, truncate if too long (can't split an edit into multiple messages)
+    # For new messages, send_message will handle splitting via split_text
     display_text = text
-    if len(display_text) > max_len:
+    if existing_ref and existing_ref.platform_data and len(display_text) > max_len:
         display_text = display_text[:max_len - 10] + "\n..."
 
     result_ref = await _send_with_fallback(session, text=display_text, existing_ref=existing_ref)
     if result_ref:
-        return result_ref, len(display_text)
+        return result_ref, len(display_text) if len(display_text) <= max_len else max_len
     return existing_ref, msg_text_len
 
 
