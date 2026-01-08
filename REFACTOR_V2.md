@@ -79,9 +79,9 @@ platforms/telegram/client.py   OR   platforms/discord/client.py
 
 ## Current Status
 
-**Phase:** 4 COMPLETE ✓
-**Last action:** Implemented Discord platform support
-**Next step:** Phase 5 - Update MCP tools for platform abstraction
+**Phase:** 5 COMPLETE ✓
+**Last action:** Updated MCP tools to use platform abstraction
+**Next step:** Phase 6 - Cleanup and final testing
 
 ### Completed
 - [x] Phase 1: Protocol definitions (PlatformClient, MessageFormatter, etc.)
@@ -109,6 +109,10 @@ platforms/telegram/client.py   OR   platforms/discord/client.py
   - [x] run_discord.py entry point
   - [x] Discord config in config.py (DISCORD_BOT_TOKEN, channel->project mapping)
   - [x] start_session_discord in session.py
+  - [x] Tests passing, pyright clean
+- [x] Phase 5: MCP tools update
+  - [x] Updated mcp_tools.py to use platform.send_document()
+  - [x] Platform-agnostic file sending
   - [x] Tests passing, pyright clean
 
 ---
