@@ -765,12 +765,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                                     response_text = ""
                                     response_msg_text_len = 0
 
-                                # Send thinking content with brain emoji
+                                # Send thinking content via platform (handles formatting)
                                 thinking_text = block.thinking
                                 if thinking_text:
-                                    formatter = session.get_formatter()
-                                    safe_thinking = formatter.escape_text(thinking_text)
-                                    await send_message(session, text=f"🧠 {formatter.italic(safe_thinking)}")
+                                    await platform.send_thinking(thinking_text)
 
                     elif isinstance(content, str) and content:
                         # Tool result - flush tool buffer first

@@ -145,6 +145,21 @@ class PlatformClient(Protocol):
         """
         ...
 
+    async def send_thinking(self, text: str) -> MessageRef:
+        """Send thinking/reasoning content with platform-appropriate styling.
+
+        Platform implementations decide presentation:
+        - Telegram: Italic text with brain emoji
+        - Discord: Embed with grey sidebar for visual separation
+
+        Args:
+            text: Raw thinking text (will be escaped by platform)
+
+        Returns:
+            Reference for the sent message
+        """
+        ...
+
 
 @runtime_checkable
 class MessageFormatter(Protocol):
