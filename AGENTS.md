@@ -7,10 +7,9 @@ Telegram bot bridging forum topics to Claude Agent SDK sessions. Each topic = on
 - `bot.py` - Telegram bot setup, handlers registration
 - `session.py` - Claude SDK integration, message streaming, tool permissions
 - `handlers.py` - Telegram message/callback handlers
-- `config.py` - Environment config (BOT_TOKEN, PROJECTS_DIR, browser settings)
+- `config.py` - Environment config (BOT_TOKEN, PROJECTS_DIR)
 - `logger.py` - Session logging
 - `diff_image.py` - Syntax-highlighted edit diffs
-- `browser_tools.py` - Playwright-based browser automation MCP tools
 
 ## Key Patterns
 - Sessions stored in `sessions: dict[int, ClaudeSession]` (keyed by thread_id)
@@ -28,5 +27,4 @@ Telegram bot bridging forum topics to Claude Agent SDK sessions. Each topic = on
 - claude-agent-sdk
 - mistune (markdown to HTML)
 - Pillow (diff images)
-- playwright (browser automation)
 

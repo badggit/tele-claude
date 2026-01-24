@@ -39,9 +39,3 @@ try:
     }
 except (json.JSONDecodeError, ValueError):
     DISCORD_CHANNEL_PROJECTS = {}
-
-# Browser automation settings
-BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "true").lower() == "true"
-BROWSER_DATA_DIR = Path(os.getenv("BROWSER_DATA_DIR", Path.home() / ".tele-bot" / "browsers"))
-# CDP endpoint for connecting to existing Chrome (e.g., "http://localhost:9222")
-BROWSER_CDP_ENDPOINT = os.getenv("BROWSER_CDP_ENDPOINT", "")

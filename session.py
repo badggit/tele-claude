@@ -32,7 +32,6 @@ from logger import SessionLogger
 from diff_image import edit_to_image
 from commands import load_contextual_commands, register_commands_for_chat
 from mcp_tools import create_telegram_mcp_server
-from browser_tools import create_browser_mcp_server, BrowserSession
 
 # Platform abstraction imports
 from platforms import PlatformClient, MessageFormatter, ButtonSpec, ButtonRow, MessageRef
@@ -65,13 +64,6 @@ DEFAULT_ALLOWED_TOOLS = [
     "Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task", "WebSearch",
     "Skill",  # Enable skills from .claude/skills/
     "mcp__telegram-tools__send_to_telegram",  # Custom tool for sending files to chat
-    # Browser automation tools
-    "mcp__browser-tools__browser_navigate",
-    "mcp__browser-tools__browser_snapshot",
-    "mcp__browser-tools__browser_click",
-    "mcp__browser-tools__browser_type",
-    "mcp__browser-tools__browser_scroll",
-    "mcp__browser-tools__browser_close",
 ]
 
 # Persistent allowlist file
@@ -160,7 +152,6 @@ class ClaudeSession:
     last_context_percent: Optional[float] = None  # Last known context remaining %
     pending_image_path: Optional[str] = None  # Buffered image waiting for prompt
     contextual_commands: list = field(default_factory=list)  # Project-specific slash commands
-    browser_session: Optional[BrowserSession] = None  # Browser automation session
 
     def get_platform(self) -> Optional[PlatformClient]:
         """Get platform client, creating from bot if needed (backwards compat)."""
@@ -565,14 +556,6 @@ async def stop_session(thread_id: int) -> bool:
 
     session.active = False
 
-    # Close browser session if open
-    if session.browser_session:
-        try:
-            await session.browser_session.close()
-        except Exception:
-            pass
-        session.browser_session = None
-
     # Close logger
     if session.logger:
         session.logger.log_session_end("stopped")
@@ -675,7 +658,6 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
 
         # Create MCP servers bound to this session
         telegram_mcp = create_telegram_mcp_server(session)
-        browser_mcp = create_browser_mcp_server(session)
 
         # Configure options - use permission handler for interactive tool approval
         options = ClaudeAgentOptions(
@@ -689,7 +671,6 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
             max_thinking_tokens=10000,  # Enable interleaved thinking between tool calls
             mcp_servers={
                 "telegram-tools": telegram_mcp,
-                "browser-tools": browser_mcp,
             },
             hooks={
                 "PreCompact": [
