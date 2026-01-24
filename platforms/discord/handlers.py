@@ -13,7 +13,7 @@ from typing import Optional, Union
 import discord
 
 from config import DISCORD_ALLOWED_GUILDS, DISCORD_CHANNEL_PROJECTS
-from session import sessions, start_session_discord, start_session_ambient_discord, send_to_claude, resolve_permission, interrupt_session, stop_session
+from session import sessions, start_session_discord, start_session_ambient_discord, start_claude_task, resolve_permission, interrupt_session, stop_session
 from utils import ensure_image_within_limits
 from commands import get_command_prompt, get_help_message
 
@@ -119,7 +119,7 @@ async def handle_message(message: discord.Message, bot: discord.Client) -> None:
                 await asyncio.sleep(0.1)
 
             # Run as background task
-            asyncio.create_task(send_to_claude(thread_id, prompt, None))
+            start_claude_task(thread_id, prompt, None)
             return
 
         # No session in this thread - check if parent channel is a project channel or #general
@@ -128,14 +128,14 @@ async def handle_message(message: discord.Message, bot: discord.Client) -> None:
             # Start new session in this thread
             success = await start_session_discord(thread_id, project_path, channel)
             if success:
-                asyncio.create_task(send_to_claude(thread_id, text, None))
+                start_claude_task(thread_id, text, None)
             else:
                 await channel.send(f"Failed to start session: project not found")
         elif _is_general_channel(channel):
             # Start ambient session for #general thread
             success = await start_session_ambient_discord(thread_id, channel)
             if success:
-                asyncio.create_task(send_to_claude(thread_id, text, None))
+                start_claude_task(thread_id, text, None)
             else:
                 await channel.send(f"Failed to start ambient session")
         return
@@ -154,7 +154,7 @@ async def handle_message(message: discord.Message, bot: discord.Client) -> None:
             # Start session in the new thread
             success = await start_session_discord(thread.id, project_path, thread)
             if success:
-                asyncio.create_task(send_to_claude(thread.id, text, None))
+                start_claude_task(thread.id, text, None)
             else:
                 await thread.send(f"Failed to start session: project not found")
         except Exception as e:
@@ -170,7 +170,7 @@ async def handle_message(message: discord.Message, bot: discord.Client) -> None:
 
             success = await start_session_ambient_discord(thread.id, thread)
             if success:
-                asyncio.create_task(send_to_claude(thread.id, text, None))
+                start_claude_task(thread.id, text, None)
             else:
                 await thread.send(f"Failed to start ambient session")
         except Exception as e:
@@ -224,7 +224,7 @@ async def handle_attachment(message: discord.Message, bot: discord.Client) -> No
                 success = await start_session_discord(thread.id, project_path, thread)
                 if success:
                     prompt = f"{image_path}\n\n{caption}"
-                    asyncio.create_task(send_to_claude(thread.id, prompt, None))
+                    start_claude_task(thread.id, prompt, None)
                 else:
                     await thread.send("Failed to start session: project not found")
             except Exception as e:
@@ -241,7 +241,7 @@ async def handle_attachment(message: discord.Message, bot: discord.Client) -> No
                 success = await start_session_ambient_discord(thread.id, thread)
                 if success:
                     prompt = f"{image_path}\n\n{caption}"
-                    asyncio.create_task(send_to_claude(thread.id, prompt, None))
+                    start_claude_task(thread.id, prompt, None)
                 else:
                     await thread.send("Failed to start ambient session")
             except Exception as e:
@@ -275,7 +275,7 @@ async def handle_attachment(message: discord.Message, bot: discord.Client) -> No
     if was_interrupted:
         await asyncio.sleep(0.1)
 
-    asyncio.create_task(send_to_claude(thread_id, prompt, None))
+    start_claude_task(thread_id, prompt, None)
 
 
 async def handle_interaction(interaction: discord.Interaction) -> None:
