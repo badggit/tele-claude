@@ -565,6 +565,60 @@ async def stop_session(thread_id: int) -> bool:
     return True
 
 
+# Patterns that indicate recoverable API errors requiring session reset
+_RECOVERABLE_ERROR_PATTERNS = [
+    "image dimensions exceed max allowed size",
+    "image.source.base64.data",
+    "many-image requests",
+]
+
+
+async def _handle_recoverable_api_error(session: ClaudeSession, error_str: str) -> bool:
+    """Handle recoverable API errors by resetting session state.
+
+    Some API errors (like image dimension limits) poison the conversation history.
+    When resumed, they keep failing. This function detects such errors and resets
+    the session_id so the next request starts fresh.
+
+    Args:
+        session: The Claude session
+        error_str: The full error string (exception + stderr)
+
+    Returns:
+        True if the error was handled (caller should return), False otherwise
+    """
+    error_lower = error_str.lower()
+
+    # Check if this is an image-related recoverable error
+    is_image_error = any(pattern.lower() in error_lower for pattern in _RECOVERABLE_ERROR_PATTERNS)
+
+    if not is_image_error:
+        return False
+
+    # Log the recovery action
+    if session.logger:
+        session.logger._write_log(f"RECOVERABLE ERROR detected, resetting session: {error_str[:200]}")
+
+    # Reset session_id to start fresh conversation
+    old_session_id = session.session_id
+    session.session_id = None
+
+    platform = session.get_platform()
+    if platform:
+        formatter = session.get_formatter()
+        await platform.send_message(
+            f"⚠️ {formatter.bold('Session Reset')}\n\n"
+            f"An image in the conversation exceeded API size limits. "
+            f"Session history has been cleared.\n\n"
+            f"Please re-send your last message to continue."
+        )
+
+    if session.logger:
+        session.logger._write_log(f"Session reset: {old_session_id} -> None")
+
+    return True
+
+
 async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None) -> None:
     """Send a message to Claude and stream the response.
 
@@ -848,15 +902,27 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
             session.logger.log_error("send_to_claude", e)
             if e.stderr:
                 session.logger.log_stderr(e.stderr)
+
+        # Check for recoverable API errors (e.g., oversized images poisoning session)
+        error_str = str(e) + (e.stderr or "")
+        if await _handle_recoverable_api_error(session, error_str):
+            return  # Error was handled and user notified
+
         error_msg = f"❌ Error: {str(e)}"
         if e.stderr:
             error_msg += f"\nStderr: {e.stderr[:500]}"
         await send_message(session, text=error_msg)
     except Exception as e:
-        error_msg = f"❌ Error: {str(e)}"
-        await send_message(session, text=error_msg)
+        error_str = str(e)
         if session.logger:
             session.logger.log_error("send_to_claude", e)
+
+        # Check for recoverable API errors (e.g., oversized images poisoning session)
+        if await _handle_recoverable_api_error(session, error_str):
+            return  # Error was handled and user notified
+
+        error_msg = f"❌ Error: {error_str}"
+        await send_message(session, text=error_msg)
     finally:
         # Always clear client reference
         session.client = None
