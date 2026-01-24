@@ -14,6 +14,7 @@ import discord
 
 from config import DISCORD_ALLOWED_GUILDS, DISCORD_CHANNEL_PROJECTS
 from session import sessions, start_session_discord, start_session_ambient_discord, send_to_claude, resolve_permission, interrupt_session, stop_session
+from utils import ensure_image_within_limits
 from commands import get_command_prompt, get_help_message
 
 logger = logging.getLogger("tele-claude.discord.handlers")
@@ -203,6 +204,9 @@ async def handle_attachment(message: discord.Message, bot: discord.Client) -> No
     image_path = Path(tempfile.gettempdir()) / f"discord_image_{image_attachment.id}.png"
     await image_attachment.save(image_path)
     image_path = str(image_path)
+
+    # Resize if needed to prevent API errors (max 2000px for multi-image requests)
+    image_path = ensure_image_within_limits(image_path)
 
     caption = message.content or "What's in this image?"
 

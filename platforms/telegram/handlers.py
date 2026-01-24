@@ -17,7 +17,7 @@ import logging
 logger = logging.getLogger("tele-claude.handlers")
 
 from config import GENERAL_TOPIC_ID, ALLOWED_CHATS
-from utils import get_project_folders
+from utils import get_project_folders, ensure_image_within_limits
 from session import sessions, start_session, start_session_ambient, send_to_claude, resolve_permission, interrupt_session
 from commands import get_command_prompt, get_help_message
 
@@ -302,6 +302,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(photo.file_id)
     photo_path = os.path.join(tempfile.gettempdir(), f"telegram_photo_{photo.file_unique_id}.jpg")
     await file.download_to_drive(photo_path)
+
+    # Resize if needed to prevent API errors (max 2000px for multi-image requests)
+    photo_path = ensure_image_within_limits(photo_path)
 
     caption = message.caption
     if caption:
