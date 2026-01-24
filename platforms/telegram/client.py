@@ -316,6 +316,59 @@ class TelegramClient(PlatformClient):
             self._log_error("send_document", e)
             return MessageRef(platform_data=None)
 
+    async def send_thinking(self, text: str) -> MessageRef:
+        """Send thinking content as italic text with brain emoji.
+
+        Bypasses markdown_to_html to directly construct HTML,
+        avoiding double-escaping issues.
+        """
+        if not text.strip():
+            return MessageRef(platform_data=None)
+
+        await self._apply_rate_limit()
+
+        # Escape HTML entities in the raw text
+        from .formatter import escape_html
+        safe_text = escape_html(text)
+
+        # Truncate if needed
+        max_len = self.max_message_length - 20  # Room for emoji and tags
+        if len(safe_text) > max_len:
+            safe_text = safe_text[:max_len - 3] + "..."
+
+        # Construct HTML directly (no markdown processing)
+        html_text = f"🧠 <i>{safe_text}</i>"
+
+        try:
+            msg = await self._bot.send_message(
+                chat_id=self._chat_id,
+                message_thread_id=self._thread_id,
+                text=html_text,
+                parse_mode="HTML",
+            )
+            self._update_rate_limit(success=True)
+            return MessageRef(platform_data=msg)
+        except Exception as e:
+            self._update_rate_limit(success=False, error=e)
+            # Fallback to plain text
+            if "parse entities" in str(e).lower() or "can't parse" in str(e).lower():
+                try:
+                    plain_text = f"🧠 {text}"
+                    if len(plain_text) > self.max_message_length:
+                        plain_text = plain_text[:self.max_message_length - 3] + "..."
+                    msg = await self._bot.send_message(
+                        chat_id=self._chat_id,
+                        message_thread_id=self._thread_id,
+                        text=plain_text,
+                    )
+                    self._update_rate_limit(success=True)
+                    return MessageRef(platform_data=msg)
+                except Exception as plain_err:
+                    self._log_error("send_thinking_plain", plain_err)
+            else:
+                self._log_error("send_thinking", e)
+            return MessageRef(platform_data=None)
+
 
 async def send_with_fallback(
     client: TelegramClient,

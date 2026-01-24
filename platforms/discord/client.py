@@ -226,3 +226,32 @@ class DiscordClient(PlatformClient):
         except Exception as e:
             self._log_error("send_document", e)
             return MessageRef(platform_data=None)
+
+    async def send_thinking(self, text: str) -> MessageRef:
+        """Send thinking content as an embed with grey sidebar."""
+        if not text.strip():
+            return MessageRef(platform_data=None)
+
+        await self._apply_rate_limit()
+
+        # Escape markdown in thinking text
+        safe_text = self._formatter.escape_text(text)
+
+        # Truncate if needed (embed description limit is 4096)
+        max_len = 4000
+        if len(safe_text) > max_len:
+            safe_text = safe_text[:max_len - 3] + "..."
+
+        # Create embed with grey sidebar for visual distinction
+        embed = discord.Embed(
+            description=f"🧠 {safe_text}",
+            color=discord.Color.greyple(),  # Muted grey color
+        )
+
+        try:
+            msg = await self._channel.send(embed=embed)
+            self._last_send = time.time()
+            return MessageRef(platform_data=msg)
+        except Exception as e:
+            self._log_error("send_thinking", e)
+            return MessageRef(platform_data=None)
