@@ -18,7 +18,7 @@ logger = logging.getLogger("tele-claude.handlers")
 
 from config import GENERAL_TOPIC_ID, ALLOWED_CHATS
 from utils import get_project_folders, ensure_image_within_limits
-from session import sessions, start_session, start_session_ambient, send_to_claude, resolve_permission, interrupt_session
+from session import sessions, start_session, start_session_ambient, start_claude_task, resolve_permission, interrupt_session
 from commands import get_command_prompt, get_help_message
 
 
@@ -316,7 +316,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if was_interrupted:
             await asyncio.sleep(0.1)
 
-        asyncio.create_task(send_to_claude(effective_thread_id, prompt, context.bot))
+        start_claude_task(effective_thread_id, prompt, context.bot)
     else:
         # Image without caption - buffer silently, wait for next text message
         session.pending_image_path = photo_path
@@ -379,7 +379,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Run as background task - don't await!
         # Awaiting would block callback processing (deadlock for permission buttons)
-        asyncio.create_task(send_to_claude(effective_thread_id, prompt, context.bot))
+        start_claude_task(effective_thread_id, prompt, context.bot)
         return
 
     # No active session for this thread - silently ignore

@@ -149,6 +149,7 @@ class ClaudeSession:
     active: bool = True
     session_id: Optional[str] = None  # For multi-turn conversation
     client: Optional[ClaudeSDKClient] = None  # Active SDK client for interrupt support
+    current_task: Optional[asyncio.Task] = None  # Active send_to_claude task for cancellation
     last_context_percent: Optional[float] = None  # Last known context remaining %
     pending_image_path: Optional[str] = None  # Buffered image waiting for prompt
     contextual_commands: list = field(default_factory=list)  # Project-specific slash commands
@@ -183,11 +184,22 @@ async def interrupt_session(thread_id: int) -> bool:
     Returns True if an active query was interrupted, False otherwise.
     """
     session = sessions.get(thread_id)
-    if not session or not session.client:
+    if not session:
         return False
 
-    await session.client.interrupt()
-    return True
+    interrupted = False
+
+    # Cancel the asyncio task first - this stops Python-side processing
+    if session.current_task and not session.current_task.done():
+        session.current_task.cancel()
+        interrupted = True
+
+    # Also signal the SDK client to stop
+    if session.client:
+        await session.client.interrupt()
+        interrupted = True
+
+    return interrupted
 
 
 async def request_tool_permission(
@@ -565,6 +577,24 @@ async def stop_session(thread_id: int) -> bool:
     return True
 
 
+def start_claude_task(thread_id: int, prompt: str, bot: Optional[Bot] = None) -> Optional[asyncio.Task]:
+    """Start send_to_claude as a background task and store reference for cancellation.
+
+    Use this instead of asyncio.create_task(send_to_claude(...)) directly.
+    The task reference is stored in session.current_task for interrupt support.
+
+    Returns:
+        The created task, or None if session doesn't exist.
+    """
+    session = sessions.get(thread_id)
+    if not session:
+        return None
+
+    task = asyncio.create_task(send_to_claude(thread_id, prompt, bot))
+    session.current_task = task
+    return task
+
+
 async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None) -> None:
     """Send a message to Claude and stream the response.
 
@@ -842,6 +872,11 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
             # Clear client reference when done
             session.client = None
 
+    except asyncio.CancelledError:
+        # Task was cancelled by interrupt_session - this is expected, not an error
+        if session.logger:
+            session.logger._write_log("Task cancelled by interrupt")
+        # Don't re-raise - we want clean termination
     except ProcessError as e:
         # Log stderr from CLI process
         if session.logger:
@@ -858,8 +893,9 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         if session.logger:
             session.logger.log_error("send_to_claude", e)
     finally:
-        # Always clear client reference
+        # Always clear references
         session.client = None
+        session.current_task = None
 
 
 async def send_or_edit_response(
