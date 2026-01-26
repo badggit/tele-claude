@@ -1,12 +1,12 @@
 # tele-claude
 
-A Telegram bot that connects forum topics to Claude Code CLI sessions.
+A multi-platform bot bridging Telegram and Discord to Claude Code SDK sessions.
 
 ## How it works
 
-- Each Telegram forum topic maps to one Claude session
+- Each Telegram forum topic or Discord thread maps to one Claude session
 - Messages are forwarded to Claude via the SDK
-- Claude responses stream back as Telegram messages
+- Claude responses stream back to the chat
 - Tool calls displayed with 🔧 indicator
 - Typing indicator shown during processing
 - Edit diffs rendered as syntax-highlighted images
@@ -47,13 +47,17 @@ echo "BOT_TOKEN=your_bot_token_here" > .env
 # Optionally set projects directory (defaults to ~/Projects)
 echo "PROJECTS_DIR=/path/to/projects" >> .env
 
-# Run
-python bot.py
+# Run Telegram bot (global project picker mode)
+python main.py telegram
 ```
 
 ## Usage
 
-### Multi-project mode (default)
+### Telegram: Multi-project mode (default)
+
+```bash
+python main.py telegram
+```
 
 1. Create a new topic in your Telegram forum group
 2. Bot auto-detects and shows a folder picker
@@ -62,24 +66,37 @@ python bot.py
 
 Or use `/new` command to manually start a session.
 
-### Local project mode
+### Telegram: Local project mode
 
 Run a bot instance anchored to a specific project directory:
 
 ```bash
-cd /path/to/your/project
-
-# Create config file
-cat > .env.telebot << EOF
+# Create config in target project
+cat > /path/to/your/project/.env.telebot << EOF
 BOT_TOKEN=your_bot_token_here
 ALLOWED_CHATS=-100xxxxx  # optional
 EOF
 
-# Run
-python /path/to/tele-claude/bot_local.py
+# Run with explicit path
+python main.py telegram --local /path/to/your/project
+
+# Or from project directory (uses CWD)
+cd /path/to/your/project
+python /path/to/tele-claude/main.py telegram --local
 ```
 
 Every new topic auto-starts a session in that directory. Useful for running separate bot instances per project.
+
+### Discord
+
+```bash
+# Add to .env
+echo "DISCORD_BOT_TOKEN=your_discord_token" >> .env
+echo 'DISCORD_CHANNEL_PROJECTS={"channel_id": "/path/to/project"}' >> .env
+
+# Run
+python main.py discord
+```
 
 ## Browser Automation
 
@@ -109,11 +126,26 @@ If no CDP endpoint is configured, the bot launches its own Chromium instance wit
 
 ## Configuration
 
+### Telegram
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `BOT_TOKEN` | Yes | - | Telegram bot token from BotFather |
 | `PROJECTS_DIR` | No | `~/Projects` | Root directory for project folders |
 | `ALLOWED_CHATS` | No | - | Comma-separated chat IDs to allow (empty = allow all) |
+
+### Discord
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DISCORD_BOT_TOKEN` | Yes | - | Discord bot token |
+| `DISCORD_CHANNEL_PROJECTS` | No | `{}` | JSON mapping channel IDs to project paths |
+| `DISCORD_ALLOWED_GUILDS` | No | - | Comma-separated guild IDs to allow |
+
+### Browser
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
 | `BROWSER_CDP_ENDPOINT` | No | - | Chrome DevTools Protocol endpoint (e.g., `http://localhost:9222`) |
 | `BROWSER_HEADLESS` | No | `true` | Run standalone Chromium in headless mode |
 | `BROWSER_DATA_DIR` | No | `~/.tele-bot/browsers` | Persistent storage for standalone browser sessions |
