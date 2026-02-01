@@ -2,6 +2,7 @@
 Discord bot runner.
 """
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -14,6 +15,7 @@ from platforms.discord.handlers import handle_message, handle_attachment, handle
 from logger import setup_logging
 
 _log = logging.getLogger("tele-claude.discord")
+_gateway_log = logging.getLogger("tele-claude.discord.gateway")
 
 # Also log to stderr so we see critical events in real-time
 _stderr_handler = logging.StreamHandler(sys.stderr)
@@ -35,6 +37,51 @@ class ClaudeBotClient(discord.Client):
     async def setup_hook(self):
         """Called after login, before READY. Start the watchdog."""
         self._watchdog_task = self.loop.create_task(self._event_loop_watchdog())
+
+    async def on_connect(self):
+        _log.info("Discord gateway connected")
+
+    async def on_disconnect(self):
+        _log.warning("Discord gateway disconnected")
+
+    async def on_resumed(self):
+        _log.info("Discord gateway resumed")
+
+    async def on_socket_event_type(self, event_type: str):
+        """Log every gateway DISPATCH event type."""
+        _gateway_log.debug("event type=%s", event_type)
+
+    async def on_error(self, event_method: str, *args, **kwargs):
+        _log.exception("Discord event error in %s", event_method)
+
+    async def on_socket_raw_receive(self, msg: str):
+        """Log every raw gateway event (op/t)."""
+        try:
+            data = json.loads(msg)
+            op = data.get("op")
+            t = data.get("t")
+            s = data.get("s")
+            if t == "MESSAGE_CREATE":
+                d = data.get("d") or {}
+                author = d.get("author") or {}
+                _gateway_log.debug(
+                    "recv op=%s t=%s s=%s id=%s channel_id=%s author_id=%s",
+                    op, t, s, d.get("id"), d.get("channel_id"), author.get("id")
+                )
+            else:
+                _gateway_log.debug("recv op=%s t=%s s=%s", op, t, s)
+        except Exception:
+            _gateway_log.debug("recv raw len=%d", len(msg))
+
+    async def on_socket_raw_send(self, msg: str):
+        """Log outgoing gateway payloads (op/t)."""
+        try:
+            data = json.loads(msg)
+            op = data.get("op")
+            t = data.get("t")
+            _gateway_log.debug("send op=%s t=%s", op, t)
+        except Exception:
+            _gateway_log.debug("send raw len=%d", len(msg))
 
     async def _event_loop_watchdog(self):
         """Periodic heartbeat to detect event loop blocks.
@@ -66,9 +113,11 @@ class ClaudeBotClient(discord.Client):
     async def on_message(self, message: discord.Message):
         # Log all messages (including bot's own) for debugging
         _log.info(
-            "on_message: author=%s channel=%s content=%s",
+            "on_message: author=%s channel=%s channel_id=%s message_id=%s content=%s",
             message.author,
             message.channel,
+            message.channel.id,
+            message.id,
             message.content[:80] if message.content else '(empty)'
         )
 
@@ -119,5 +168,6 @@ def run() -> None:
     client = ClaudeBotClient(
         intents=intents,
         max_ratelimit_timeout=30.0,  # Raise RateLimited instead of silently sleeping >30s
+        enable_debug_events=True,  # Enable raw gateway receive/send events
     )
     client.run(DISCORD_BOT_TOKEN)

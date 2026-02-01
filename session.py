@@ -75,6 +75,15 @@ ALLOWLIST_FILE = Path(__file__).parent / "tool_allowlist.json"
 pending_permissions: dict[str, tuple[asyncio.Future, Optional["SessionLogger"]]] = {}
 
 
+def _log_session_debug(session: Optional["ClaudeSession"], context: str, message: str, **kwargs: Any) -> None:
+    """Log debug details to SessionLogger if available, else module logger."""
+    if session and session.logger:
+        session.logger.log_debug(context, message, **kwargs)
+    else:
+        extra = f" {kwargs}" if kwargs else ""
+        _log.debug(f"{context}: {message}{extra}")
+
+
 def load_allowlist() -> set[str]:
     """Load the persistent tool allowlist."""
     if ALLOWLIST_FILE.exists():
@@ -198,29 +207,82 @@ async def interrupt_session(thread_id: int) -> bool:
 
     # Check if there's an active task to interrupt
     if not session.current_task or session.current_task.done():
+        _log_session_debug(
+            session,
+            "interrupt",
+            "No active task to interrupt",
+            thread_id=thread_id,
+            has_task=bool(session.current_task),
+            task_done=bool(session.current_task.done()) if session.current_task else None,
+        )
         return False
 
     # Phase 1: Soft interrupt - set flag and signal SDK
     if session.interrupt_event:
         session.interrupt_event.set()
+        _log_session_debug(session, "interrupt", "Interrupt flag set", thread_id=thread_id)
 
     if session.client:
-        await session.client.interrupt()
+        t0 = time.perf_counter()
+        _log_session_debug(session, "interrupt", "Sending client.interrupt()", thread_id=thread_id)
+        try:
+            await session.client.interrupt()
+            _log_session_debug(
+                session,
+                "interrupt",
+                "client.interrupt() completed",
+                thread_id=thread_id,
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+            )
+        except Exception as e:
+            if session.logger:
+                session.logger.log_error("interrupt_session.client_interrupt", e)
+            _log_session_debug(
+                session,
+                "interrupt",
+                "client.interrupt() failed",
+                thread_id=thread_id,
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                error=str(e),
+            )
+    else:
+        _log_session_debug(session, "interrupt", "No client available for interrupt", thread_id=thread_id)
 
     # Phase 2: Wait for task to drain and complete gracefully
     try:
+        t0 = time.perf_counter()
+        _log_session_debug(session, "interrupt", "Waiting for current_task to finish", thread_id=thread_id)
         await asyncio.wait_for(session.current_task, timeout=2.0)
+        _log_session_debug(
+            session,
+            "interrupt",
+            "current_task finished",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+        )
     except asyncio.TimeoutError:
         # Phase 3: Hard cancel as fallback
-        if session.logger:
-            session.logger._write_log("Interrupt timeout - hard cancelling task")
+        _log_session_debug(
+            session,
+            "interrupt",
+            "Timeout waiting for task; hard cancelling",
+            thread_id=thread_id,
+        )
         session.current_task.cancel()
         try:
+            t1 = time.perf_counter()
             await asyncio.wait_for(session.current_task, timeout=2.0)
+            _log_session_debug(
+                session,
+                "interrupt",
+                "Hard cancel completed",
+                thread_id=thread_id,
+                elapsed_ms=int((time.perf_counter() - t1) * 1000),
+            )
         except asyncio.TimeoutError:
-            if session.logger:
-                session.logger._write_log("Interrupt hard-cancel timed out")
+            _log_session_debug(session, "interrupt", "Hard cancel timed out", thread_id=thread_id)
         except asyncio.CancelledError:
+            _log_session_debug(session, "interrupt", "Task cancelled (CancelledError)", thread_id=thread_id)
             pass
 
     return True
@@ -615,11 +677,21 @@ def start_claude_task(thread_id: int, prompt: str, bot: Optional[Bot] = None) ->
     """
     session = sessions.get(thread_id)
     if not session:
+        _log.debug(f"start_claude_task: no session for thread_id={thread_id}")
         return None
 
     task = asyncio.create_task(send_to_claude(thread_id, prompt, bot))
     session.current_task = task
+    _log_session_debug(
+        session,
+        "task",
+        "Started send_to_claude task",
+        thread_id=thread_id,
+        task_id=id(task),
+        prompt_len=len(prompt),
+    )
     return task
+
 
 
 def _extract_tool_result_text(block: ToolResultBlock) -> str:
@@ -660,12 +732,23 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
     if not session or not session.active:
         return
 
+    start_t = time.perf_counter()
+    _log_session_debug(
+        session,
+        "send_to_claude",
+        "Start",
+        thread_id=thread_id,
+        prompt_len=len(prompt),
+        session_id=session.session_id,
+    )
+
     platform = session.get_platform()
     if not platform:
         return
 
     # Initialize interrupt event for this query (clear any previous state)
     session.interrupt_event = asyncio.Event()
+    _log_session_debug(session, "send_to_claude", "Interrupt event created", thread_id=thread_id)
 
     # Log user input
     if session.logger:
@@ -784,8 +867,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         async with ClaudeSDKClient(options=options) as client:
             # Store client reference for interrupt support
             session.client = client
+            _log_session_debug(session, "send_to_claude", "Client ready", thread_id=thread_id)
 
             await client.query(prompt_stream())
+            _log_session_debug(session, "send_to_claude", "Query sent", thread_id=thread_id)
             async for message in client.receive_response():
                 # Refresh typing indicator on each message
                 await send_typing_action(session)
@@ -796,15 +881,24 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
 
                 # Check for interrupt - drain until we get ack or ResultMessage
                 if session.interrupt_event and session.interrupt_event.is_set():
+                    _log_session_debug(
+                        session,
+                        "interrupt",
+                        "Interrupt flag detected while streaming",
+                        thread_id=thread_id,
+                        msg_type=type(message).__name__,
+                    )
                     # Check for interrupt acknowledgment from SDK
                     if isinstance(message, UserMessage):
                         content = message.content
                         if isinstance(content, str) and "interrupted" in content.lower():
                             # Display the interrupt message and exit
+                            _log_session_debug(session, "interrupt", "SDK interrupt ack (UserMessage)", thread_id=thread_id)
                             await send_message(session, text=f"_{content}_")
                             break
                     elif isinstance(message, ResultMessage):
                         # Capture session metadata before exiting
+                        _log_session_debug(session, "interrupt", "ResultMessage while interrupted", thread_id=thread_id)
                         if message.session_id:
                             session.session_id = message.session_id
                         if message.usage:
@@ -993,6 +1087,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
             # This prevents interrupt_session from trying to interrupt a finished SDK,
             # and ensures the task won't hang on SDK cleanup if a new message arrives.
             session.client = None
+            _log_session_debug(session, "send_to_claude", "Stream loop ended", thread_id=thread_id)
 
             # Flush any remaining buffers (after loop)
             await flush_tool_buffer()
@@ -1033,10 +1128,25 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                                 # Warning doesn't fit, send separately
                                 await send_message(session, text=f"⚠️ {context_remaining:.0f}% context remaining")
 
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "Completed",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+        )
+
     except asyncio.CancelledError:
         # Hard cancel fallback - only happens if soft interrupt timed out
         if session.logger:
             session.logger._write_log("Task hard-cancelled after timeout")
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "CancelledError",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+        )
         # Notify user (SDK ack message wasn't received in time)
         await send_message(session, text="_[interrupted by user]_")
         # Don't re-raise - we want clean termination
@@ -1050,15 +1160,38 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         if e.stderr:
             error_msg += f"\nStderr: {e.stderr[:500]}"
         await send_message(session, text=error_msg)
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "ProcessError",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+            error=str(e),
+        )
     except Exception as e:
         error_msg = f"❌ Error: {str(e)}"
         await send_message(session, text=error_msg)
         if session.logger:
             session.logger.log_error("send_to_claude", e)
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "Exception",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+            error=str(e),
+        )
     finally:
         # Always clear references
         session.client = None
         session.current_task = None
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "End (cleanup)",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+        )
 
 
 async def send_or_edit_response(
@@ -1459,4 +1592,3 @@ def split_text(text: str, max_len: int = 4000) -> list[str]:
         text = text[split_pos:].lstrip()
 
     return chunks
-
