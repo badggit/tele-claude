@@ -30,13 +30,54 @@ logging.getLogger("tele-claude").addHandler(_stderr_handler)
 class ClaudeBotClient(discord.Client):
     """Discord client for Claude Code bridge."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._watchdog_task = None
+        self._watchdog_task: asyncio.Task[None] | None = None
+        self._task_factory_registered: bool = False
+        self._defer_task_factory: bool = False
 
-    async def setup_hook(self):
+    async def setup_hook(self) -> None:
         """Called after login, before READY. Start the watchdog."""
         self._watchdog_task = self.loop.create_task(self._event_loop_watchdog())
+        from task_api import start_task_api
+
+        await start_task_api()
+        if self.guilds:
+            await self._register_task_factory()
+        else:
+            self._defer_task_factory = True
+
+    async def _register_task_factory(self) -> None:
+        if self._task_factory_registered:
+            return
+
+        from task_api import register_task_channel_factory
+        from session import start_session_ambient_discord
+
+        bot_client = self
+
+        async def create_discord_task_channel(task_name: str) -> int:
+            tasks_channel = None
+            for guild in bot_client.guilds:
+                for channel in guild.text_channels:
+                    if channel.name == "tasks":
+                        tasks_channel = channel
+                        break
+                if tasks_channel:
+                    break
+
+            if not tasks_channel:
+                raise RuntimeError("No #tasks channel found in any authorized guild")
+
+            thread = await tasks_channel.create_thread(
+                name=task_name,
+                type=discord.ChannelType.public_thread,
+            )
+            await start_session_ambient_discord(thread.id, thread)
+            return thread.id
+
+        register_task_channel_factory(create_discord_task_channel)
+        self._task_factory_registered = True
 
     async def on_connect(self):
         _log.info("Discord gateway connected")
@@ -106,9 +147,12 @@ class ClaudeBotClient(discord.Client):
             else:
                 logger.debug("Watchdog heartbeat: %.1fs (ok)", elapsed)
 
-    async def on_ready(self):
+    async def on_ready(self) -> None:
         _log.info(f"Discord bot logged in as {self.user}")
         _log.info(f"Configured channel mappings: {DISCORD_CHANNEL_PROJECTS}")
+        if self._defer_task_factory and not self._task_factory_registered:
+            self._defer_task_factory = False
+            await self._register_task_factory()
 
     async def on_message(self, message: discord.Message):
         # Log all messages (including bot's own) for debugging

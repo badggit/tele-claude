@@ -9,3 +9,6 @@ websockets>=12.0
 
 # Discord support
 discord.py>=2.3.0
+
+# Task injection API
+aiohttp>=3.9.0

@@ -50,3 +50,7 @@ try:
     }
 except (json.JSONDecodeError, ValueError):
     DISCORD_CHANNEL_PROJECTS = {}
+
+# --- Task Injection API ---
+TASK_API_HOST = os.getenv("TASK_API_HOST", "127.0.0.1")
+TASK_API_PORT = _env_int("TASK_API_PORT", 9111)
