@@ -61,6 +61,8 @@ async def main():
         
         await client.close()
     
+    if not DISCORD_BOT_TOKEN:
+        raise ValueError("DISCORD_BOT_TOKEN not found in environment")
     await client.start(DISCORD_BOT_TOKEN)
 
 if __name__ == "__main__":
