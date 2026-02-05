@@ -32,7 +32,26 @@ def run_global() -> None:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN not found in environment")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    async def _post_init(app: Application) -> None:
+        from config import ALLOWED_CHATS
+        from session import start_session_ambient
+        from task_api import register_task_channel_factory, start_task_api
+
+        bot = app.bot
+        if ALLOWED_CHATS:
+            chat_id = next(iter(ALLOWED_CHATS))
+
+            async def create_telegram_task_channel(task_name: str) -> int:
+                topic = await bot.create_forum_topic(chat_id=chat_id, name=task_name)
+                thread_id = topic.message_thread_id
+                await start_session_ambient(chat_id, thread_id, bot)
+                return thread_id
+
+            register_task_channel_factory(create_telegram_task_channel)
+
+        await start_task_api()
+
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     # Handle new forum topic created (auto-detect)
     app.add_handler(MessageHandler(
@@ -132,7 +151,26 @@ def run_local(local_cwd: Path) -> None:
                 text=f"Failed to start session in {local_name}"
             )
 
-    app = Application.builder().token(bot_token).build()
+    async def _post_init(app: Application) -> None:
+        from config import ALLOWED_CHATS
+        from session import start_session_ambient
+        from task_api import register_task_channel_factory, start_task_api
+
+        bot = app.bot
+        if ALLOWED_CHATS:
+            chat_id = next(iter(ALLOWED_CHATS))
+
+            async def create_telegram_task_channel(task_name: str) -> int:
+                topic = await bot.create_forum_topic(chat_id=chat_id, name=task_name)
+                thread_id = topic.message_thread_id
+                await start_session_ambient(chat_id, thread_id, bot)
+                return thread_id
+
+            register_task_channel_factory(create_telegram_task_channel)
+
+        await start_task_api()
+
+    app = Application.builder().token(bot_token).post_init(_post_init).build()
 
     # Store local project path in bot_data
     app.bot_data["local_project_dir"] = str(local_cwd)

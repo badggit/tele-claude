@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from typing import Any, Optional
+from urllib import error, request
+
+
+def _build_url(host: str, port: int, path: str) -> str:
+    return f"http://{host}:{port}{path}"
+
+
+def _request_json(method: str, url: str, payload: Optional[dict[str, Any]] = None) -> Any:
+    headers = {"Accept": "application/json"}
+    body: Optional[bytes] = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = request.Request(url, data=body, headers=headers, method=method)
+    with request.urlopen(req) as resp:
+        text = resp.read().decode("utf-8")
+        if not text:
+            return None
+        return json.loads(text)
+
+
+def _print_json(payload: Any) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Inject a task into the running bot")
+    parser.add_argument("prompt", nargs="?", help="Task prompt")
+    parser.add_argument("-f", "--prompt-file", type=str, help="Read prompt from file")
+    parser.add_argument("-t", "--thread-id", type=int, help="Existing session thread ID")
+    parser.add_argument("--task-name", type=str, help="Name for new thread/topic")
+    parser.add_argument("-l", "--list-sessions", action="store_true", help="List active sessions")
+    parser.add_argument("--health", action="store_true", help="Health check")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="API host")
+    parser.add_argument("--port", type=int, default=9111, help="API port")
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.list_sessions and args.health:
+        parser.error("Use only one of --list-sessions or --health")
+
+    if args.list_sessions:
+        url = _build_url(args.host, args.port, "/sessions")
+        _print_json(_request_json("GET", url))
+        return 0
+
+    if args.health:
+        url = _build_url(args.host, args.port, "/health")
+        _print_json(_request_json("GET", url))
+        return 0
+
+    prompt = args.prompt
+    if args.prompt_file:
+        try:
+            with open(args.prompt_file) as f:
+                prompt = f.read().strip()
+        except OSError as exc:
+            parser.error(f"Cannot read prompt file: {exc}")
+    if not prompt:
+        parser.error("prompt is required (positional or --prompt-file) unless --list-sessions or --health is set")
+
+    payload: dict[str, Any] = {"prompt": prompt}
+    if args.thread_id is not None:
+        payload["thread_id"] = args.thread_id
+    if args.task_name:
+        payload["task_name"] = args.task_name
+
+    url = _build_url(args.host, args.port, "/inject")
+    _print_json(_request_json("POST", url, payload))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        if body:
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                payload = {"error": body}
+        else:
+            payload = {"error": exc.reason}
+        print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
+        sys.exit(1)
+    except error.URLError as exc:
+        print(f"Connection error: {exc.reason}", file=sys.stderr)
+        sys.exit(1)

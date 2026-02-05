@@ -24,7 +24,8 @@ from telegram.constants import ChatAction
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ProcessError, PermissionResultAllow, PermissionResultDeny, HookMatcher, HookContext
 from claude_agent_sdk.types import (
     SystemPromptPreset, ToolPermissionContext, HookInput, HookJSONOutput,
-    UserMessage, AssistantMessage, ResultMessage, TextBlock, ToolUseBlock, ThinkingBlock
+    UserMessage, AssistantMessage, ResultMessage, SystemMessage,
+    TextBlock, ToolUseBlock, ThinkingBlock, ToolResultBlock
 )
 
 from config import PROJECTS_DIR
@@ -58,6 +59,7 @@ MODEL_CONTEXT_WINDOWS = {
 
 # Warn user when context remaining drops below this percentage
 CONTEXT_WARNING_THRESHOLD = 15
+MAX_DIFF_IMAGE_INPUT_CHARS = 20000
 
 # Tools that are always allowed without prompting
 DEFAULT_ALLOWED_TOOLS = [
@@ -71,6 +73,15 @@ ALLOWLIST_FILE = Path(__file__).parent / "tool_allowlist.json"
 
 # Pending permission requests: request_id -> (Future, SessionLogger)
 pending_permissions: dict[str, tuple[asyncio.Future, Optional["SessionLogger"]]] = {}
+
+
+def _log_session_debug(session: Optional["ClaudeSession"], context: str, message: str, **kwargs: Any) -> None:
+    """Log debug details to SessionLogger if available, else module logger."""
+    if session and session.logger:
+        session.logger.log_debug(context, message, **kwargs)
+    else:
+        extra = f" {kwargs}" if kwargs else ""
+        _log.debug(f"{context}: {message}{extra}")
 
 
 def load_allowlist() -> set[str]:
@@ -150,9 +161,11 @@ class ClaudeSession:
     session_id: Optional[str] = None  # For multi-turn conversation
     client: Optional[ClaudeSDKClient] = None  # Active SDK client for interrupt support
     current_task: Optional[asyncio.Task] = None  # Active send_to_claude task for cancellation
+    interrupt_event: Optional[asyncio.Event] = None  # Set when interrupt requested, cleared on new query
     last_context_percent: Optional[float] = None  # Last known context remaining %
     pending_image_path: Optional[str] = None  # Buffered image waiting for prompt
     contextual_commands: list = field(default_factory=list)  # Project-specific slash commands
+    sandboxed: bool = False  # If True, only load project settings (no ~/.claude/)
 
     def get_platform(self) -> Optional[PlatformClient]:
         """Get platform client, creating from bot if needed (backwards compat)."""
@@ -181,25 +194,98 @@ class ClaudeSession:
 async def interrupt_session(thread_id: int) -> bool:
     """Interrupt the active Claude response for a session.
 
+    Uses two-phase soft/hard interrupt:
+    1. Set interrupt flag + call client.interrupt()
+    2. Wait for reader to drain and receive interrupt ack
+    3. Hard cancel only as fallback after timeout
+
     Returns True if an active query was interrupted, False otherwise.
     """
     session = sessions.get(thread_id)
     if not session:
         return False
 
-    interrupted = False
+    # Check if there's an active task to interrupt
+    if not session.current_task or session.current_task.done():
+        _log_session_debug(
+            session,
+            "interrupt",
+            "No active task to interrupt",
+            thread_id=thread_id,
+            has_task=bool(session.current_task),
+            task_done=bool(session.current_task.done()) if session.current_task else None,
+        )
+        return False
 
-    # Cancel the asyncio task first - this stops Python-side processing
-    if session.current_task and not session.current_task.done():
-        session.current_task.cancel()
-        interrupted = True
+    # Phase 1: Soft interrupt - set flag and signal SDK
+    if session.interrupt_event:
+        session.interrupt_event.set()
+        _log_session_debug(session, "interrupt", "Interrupt flag set", thread_id=thread_id)
 
-    # Also signal the SDK client to stop
     if session.client:
-        await session.client.interrupt()
-        interrupted = True
+        t0 = time.perf_counter()
+        _log_session_debug(session, "interrupt", "Sending client.interrupt()", thread_id=thread_id)
+        try:
+            await session.client.interrupt()
+            _log_session_debug(
+                session,
+                "interrupt",
+                "client.interrupt() completed",
+                thread_id=thread_id,
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+            )
+        except Exception as e:
+            if session.logger:
+                session.logger.log_error("interrupt_session.client_interrupt", e)
+            _log_session_debug(
+                session,
+                "interrupt",
+                "client.interrupt() failed",
+                thread_id=thread_id,
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                error=str(e),
+            )
+    else:
+        _log_session_debug(session, "interrupt", "No client available for interrupt", thread_id=thread_id)
 
-    return interrupted
+    # Phase 2: Wait for task to drain and complete gracefully
+    try:
+        t0 = time.perf_counter()
+        _log_session_debug(session, "interrupt", "Waiting for current_task to finish", thread_id=thread_id)
+        await asyncio.wait_for(session.current_task, timeout=2.0)
+        _log_session_debug(
+            session,
+            "interrupt",
+            "current_task finished",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+        )
+    except asyncio.TimeoutError:
+        # Phase 3: Hard cancel as fallback
+        _log_session_debug(
+            session,
+            "interrupt",
+            "Timeout waiting for task; hard cancelling",
+            thread_id=thread_id,
+        )
+        session.current_task.cancel()
+        try:
+            t1 = time.perf_counter()
+            await asyncio.wait_for(session.current_task, timeout=2.0)
+            _log_session_debug(
+                session,
+                "interrupt",
+                "Hard cancel completed",
+                thread_id=thread_id,
+                elapsed_ms=int((time.perf_counter() - t1) * 1000),
+            )
+        except asyncio.TimeoutError:
+            _log_session_debug(session, "interrupt", "Hard cancel timed out", thread_id=thread_id)
+        except asyncio.CancelledError:
+            _log_session_debug(session, "interrupt", "Task cancelled (CancelledError)", thread_id=thread_id)
+            pass
+
+    return True
 
 
 async def request_tool_permission(
@@ -418,6 +504,7 @@ async def start_session_local(chat_id: int, thread_id: int, cwd: str, bot: Bot) 
     """Start a Claude session with an absolute path (for local project bot).
 
     Logs are stored in <cwd>/.bot-logs/ instead of global logs dir.
+    Sandboxed mode: only loads project settings, not ~/.claude/ context.
     """
     cwd_path = Path(cwd)
     if not cwd_path.exists():
@@ -425,7 +512,7 @@ async def start_session_local(chat_id: int, thread_id: int, cwd: str, bot: Bot) 
 
     # Use project-local logs directory
     logs_dir = cwd_path / ".bot-logs"
-    return await _start_session_impl(chat_id, thread_id, cwd, cwd_path.name, bot, logs_dir)
+    return await _start_session_impl(chat_id, thread_id, cwd, cwd_path.name, bot, logs_dir, sandboxed=True)
 
 
 async def _start_session_impl(
@@ -434,7 +521,8 @@ async def _start_session_impl(
     cwd: str,
     display_name: str,
     bot: Bot,
-    logs_dir: Optional[Path] = None
+    logs_dir: Optional[Path] = None,
+    sandboxed: bool = False
 ) -> bool:
     """Internal: start Telegram session with given cwd path."""
     # Create logger (use custom logs_dir if provided)
@@ -462,6 +550,7 @@ async def _start_session_impl(
         bot=bot,  # Keep for backwards compat
         logger=logger,
         contextual_commands=contextual_commands,
+        sandboxed=sandboxed,
     )
 
     # Register commands with Telegram for autocompletion
@@ -588,11 +677,49 @@ def start_claude_task(thread_id: int, prompt: str, bot: Optional[Bot] = None) ->
     """
     session = sessions.get(thread_id)
     if not session:
+        _log.debug(f"start_claude_task: no session for thread_id={thread_id}")
         return None
 
     task = asyncio.create_task(send_to_claude(thread_id, prompt, bot))
     session.current_task = task
+    _log_session_debug(
+        session,
+        "task",
+        "Started send_to_claude task",
+        thread_id=thread_id,
+        task_id=id(task),
+        prompt_len=len(prompt),
+    )
     return task
+
+
+
+def _extract_tool_result_text(block: ToolResultBlock) -> str:
+    """Extract displayable text from a ToolResultBlock.
+
+    ToolResultBlock.content is str | list[dict] | None.
+    For list[dict], only extracts text-type items (skips images/base64).
+    Prefixes with ERROR: if block.is_error.
+    """
+    block_content = block.content
+    if block_content is None:
+        text = ""
+    elif isinstance(block_content, str):
+        text = block_content
+    else:
+        # list[dict] — only extract text items, skip images/binary
+        parts = []
+        for item in block_content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        text = "\n".join(parts)
+
+    if block.is_error and text:
+        text = f"ERROR: {text}"
+    elif block.is_error:
+        text = "ERROR"
+
+    return text
 
 
 async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None) -> None:
@@ -605,9 +732,23 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
     if not session or not session.active:
         return
 
+    start_t = time.perf_counter()
+    _log_session_debug(
+        session,
+        "send_to_claude",
+        "Start",
+        thread_id=thread_id,
+        prompt_len=len(prompt),
+        session_id=session.session_id,
+    )
+
     platform = session.get_platform()
     if not platform:
         return
+
+    # Initialize interrupt event for this query (clear any previous state)
+    session.interrupt_event = asyncio.Event()
+    _log_session_debug(session, "send_to_claude", "Interrupt event created", thread_id=thread_id)
 
     # Log user input
     if session.logger:
@@ -697,7 +838,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
             cwd=session.cwd,
             resume=session.session_id,  # Resume previous conversation if exists
             system_prompt=system_prompt,
-            setting_sources=["user", "project"],  # Load skills from ~/.claude/skills/ and .claude/skills/
+            setting_sources=["project"] if session.sandboxed else ["user", "project"],  # Sandboxed: project only
             max_thinking_tokens=10000,  # Enable interleaved thinking between tool calls
             mcp_servers={
                 "telegram-tools": telegram_mcp,
@@ -726,8 +867,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         async with ClaudeSDKClient(options=options) as client:
             # Store client reference for interrupt support
             session.client = client
+            _log_session_debug(session, "send_to_claude", "Client ready", thread_id=thread_id)
 
             await client.query(prompt_stream())
+            _log_session_debug(session, "send_to_claude", "Query sent", thread_id=thread_id)
             async for message in client.receive_response():
                 # Refresh typing indicator on each message
                 await send_typing_action(session)
@@ -736,25 +879,90 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                 if session.logger:
                     session.logger.log_sdk_message(message)
 
-                # Handle different message types based on their class
-                if isinstance(message, (UserMessage, AssistantMessage)):
-                    content = message.content
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, TextBlock):
-                                # Text content - flush tools first, then accumulate text
-                                await flush_tool_buffer()
+                # Check for interrupt - drain until we get ack or ResultMessage
+                if session.interrupt_event and session.interrupt_event.is_set():
+                    _log_session_debug(
+                        session,
+                        "interrupt",
+                        "Interrupt flag detected while streaming",
+                        thread_id=thread_id,
+                        msg_type=type(message).__name__,
+                    )
+                    # Check for interrupt acknowledgment from SDK
+                    if isinstance(message, UserMessage):
+                        content = message.content
+                        if isinstance(content, str) and "interrupted" in content.lower():
+                            # Display the interrupt message and exit
+                            _log_session_debug(session, "interrupt", "SDK interrupt ack (UserMessage)", thread_id=thread_id)
+                            await send_message(session, text=f"_{content}_")
+                            break
+                    elif isinstance(message, ResultMessage):
+                        # Capture session metadata before exiting
+                        _log_session_debug(session, "interrupt", "ResultMessage while interrupted", thread_id=thread_id)
+                        if message.session_id:
+                            session.session_id = message.session_id
+                        if message.usage:
+                            last_usage = message.usage
+                        cost = message.total_cost_usd
+                        duration = message.duration_ms
+                        if session.logger and cost is not None:
+                            session.logger.log_session_stats(cost, duration, last_usage or {})
+                        break
+                    # Skip handling other messages while draining
+                    continue
 
+                # === Message dispatch — type-correct if/elif chain ===
+
+                # Branch 1: SystemMessage
+                if isinstance(message, SystemMessage):
+                    if message.subtype == "init":
+                        sid = message.data.get("session_id")
+                        if sid and not session.session_id:
+                            session.session_id = sid
+                    if session.logger:
+                        session.logger.log_debug("send_to_claude", f"SystemMessage: {message.subtype}")
+                    continue
+
+                # Branch 2: AssistantMessage (content is ALWAYS list[ContentBlock])
+                elif isinstance(message, AssistantMessage):
+                    current_model = message.model
+
+                    # API errors — display before subagent check (user should see rate limits from subagents)
+                    if message.error:
+                        error_label = message.error.replace("_", " ").title()
+                        await send_message(session, text=f"⚠️ API error: {error_label}")
+
+                    is_subagent = message.parent_tool_use_id is not None
+
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            if not block.text.strip() or block.text.strip() == "(no content)":
+                                continue
+
+                            if is_subagent:
+                                await flush_tool_buffer()
+                                fmt = session.get_formatter()
+                                await send_message(session, text=fmt.blockquote(block.text))
+                            else:
+                                await flush_tool_buffer()
                                 response_text += block.text
                                 response_ref, response_msg_text_len = await send_or_edit_response(
-                                    session, existing_ref=response_ref, text=response_text, msg_text_len=response_msg_text_len
+                                    session, existing_ref=response_ref, text=response_text,
+                                    msg_text_len=response_msg_text_len
                                 )
 
-                            elif isinstance(block, ToolUseBlock):
-                                # Tool use block - buffer it
+                        elif isinstance(block, ToolUseBlock):
+                            if is_subagent:
+                                if session.logger:
+                                    session.logger.log_debug(
+                                        "send_to_claude",
+                                        f"Subagent tool use: {block.name} (parent={message.parent_tool_use_id})"
+                                    )
+                            else:
                                 if response_text.strip():
                                     response_ref, response_msg_text_len = await send_or_edit_response(
-                                        session, existing_ref=response_ref, text=response_text, msg_text_len=response_msg_text_len
+                                        session, existing_ref=response_ref, text=response_text,
+                                        msg_text_len=response_msg_text_len
                                     )
                                     response_ref = None
                                     response_text = ""
@@ -763,74 +971,125 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                                 tool_name = block.name
                                 tool_input = block.input
 
-                                # If different tool type, flush buffer first
                                 if tool_buffer_name and tool_buffer_name != tool_name:
                                     await flush_tool_buffer()
 
-                                # Add to buffer and update message immediately
                                 tool_buffer.append((tool_name, tool_input))
                                 tool_buffer_name = tool_name
                                 await update_tool_buffer_message()
 
-                                # Buffer diff image for Edit tool
                                 if tool_name == "Edit" and "old_string" in tool_input and "new_string" in tool_input:
                                     file_path = tool_input.get("file_path", "file")
-                                    img_buffer = edit_to_image(
-                                        file_path=file_path,
-                                        old_string=tool_input["old_string"],
-                                        new_string=tool_input["new_string"]
-                                    )
+                                    old_string = tool_input["old_string"]
+                                    new_string = tool_input["new_string"]
+                                    if len(old_string) + len(new_string) <= MAX_DIFF_IMAGE_INPUT_CHARS:
+                                        img_buffer = await asyncio.to_thread(
+                                            edit_to_image,
+                                            file_path=file_path,
+                                            old_string=old_string,
+                                            new_string=new_string
+                                        )
+                                    else:
+                                        img_buffer = None
                                     if img_buffer:
                                         filename = file_path.split("/")[-1] if "/" in file_path else file_path
                                         diff_images.append((img_buffer, filename))
 
-                            elif isinstance(block, ThinkingBlock):
-                                # Interleaved thinking - flush any pending content first
+                        elif isinstance(block, ThinkingBlock):
+                            if not is_subagent:
                                 await flush_tool_buffer()
                                 if response_text.strip():
                                     response_ref, response_msg_text_len = await send_or_edit_response(
-                                        session, existing_ref=response_ref, text=response_text, msg_text_len=response_msg_text_len
+                                        session, existing_ref=response_ref, text=response_text,
+                                        msg_text_len=response_msg_text_len
                                     )
                                     response_ref = None
                                     response_text = ""
                                     response_msg_text_len = 0
 
-                                # Send thinking content via platform (handles formatting)
                                 thinking_text = block.thinking
                                 if thinking_text:
                                     await platform.send_thinking(thinking_text)
 
-                    elif isinstance(content, str) and content:
-                        # Tool result - flush tool buffer first
-                        await flush_tool_buffer()
+                        elif isinstance(block, ToolResultBlock):
+                            # Only display error results — successful tool output is noise
+                            # (Claude incorporates relevant info in its text response)
+                            if block.is_error:
+                                text = _extract_tool_result_text(block)
+                                if text:
+                                    await flush_tool_buffer()
+                                    output = format_tool_output(text)
+                                    if output:
+                                        fmt = session.get_formatter()
+                                        safe = fmt.escape_text(output)
+                                        if is_subagent:
+                                            await send_message(session, text=fmt.blockquote(safe))
+                                        else:
+                                            await send_message(session, text=fmt.code_block(safe))
 
-                        output = format_tool_output(content)
-                        if output:
-                            # Escape HTML entities in output
-                            formatter = session.get_formatter()
-                            safe_output = formatter.escape_text(output)
-                            await send_message(session, text=formatter.code_block(safe_output))
+                # Branch 3: UserMessage (content is str | list[ContentBlock])
+                elif isinstance(message, UserMessage):
+                    is_subagent = message.parent_tool_use_id is not None
+                    content = message.content
 
-                        # Refresh typing - more content likely coming after tool result
-                        await send_typing_action(session)
+                    if isinstance(content, str):
+                        # Tool result strings are noisy — only refresh typing indicator
+                        if content:
+                            await send_typing_action(session)
 
-                # Capture model from AssistantMessage
-                if isinstance(message, AssistantMessage):
-                    current_model = message.model
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, ToolResultBlock):
+                                # Only display error results
+                                if block.is_error:
+                                    await flush_tool_buffer()
+                                    text = _extract_tool_result_text(block)
+                                    output = format_tool_output(text) if text else None
+                                    if output:
+                                        fmt = session.get_formatter()
+                                        safe = fmt.escape_text(output)
+                                        if is_subagent:
+                                            await send_message(session, text=fmt.blockquote(safe))
+                                        else:
+                                            await send_message(session, text=fmt.code_block(safe))
+                                await send_typing_action(session)
 
-                # Capture session_id and usage from ResultMessage
-                if isinstance(message, ResultMessage):
+                            elif isinstance(block, TextBlock):
+                                # Suppress tool result text output (noisy, non-actionable)
+                                await send_typing_action(session)
+
+                # Branch 4: ResultMessage
+                elif isinstance(message, ResultMessage):
                     if message.session_id:
                         session.session_id = message.session_id
                     if message.usage:
                         last_usage = message.usage
-                    # Log stats (but don't show cost to user - it's included in subscription)
+
+                    # Surface session-level errors
+                    if message.is_error:
+                        error_text = message.result or "Session ended with an error"
+                        await send_message(session, text=f"⚠️ {error_text}")
+
                     cost = message.total_cost_usd
                     duration = message.duration_ms
                     if session.logger and cost is not None:
                         session.logger.log_session_stats(cost, duration, last_usage or {})
 
-            # Flush any remaining buffers (inside async with, after loop)
+                # Branch 5: Catch-all (StreamEvent or unknown)
+                else:
+                    if session.logger:
+                        session.logger.log_debug(
+                            "send_to_claude",
+                            f"Unhandled message type: {type(message).__name__}"
+                        )
+
+            # Clear client reference IMMEDIATELY after loop exits.
+            # This prevents interrupt_session from trying to interrupt a finished SDK,
+            # and ensures the task won't hang on SDK cleanup if a new message arrives.
+            session.client = None
+            _log_session_debug(session, "send_to_claude", "Stream loop ended", thread_id=thread_id)
+
+            # Flush any remaining buffers (after loop)
             await flush_tool_buffer()
             if response_text.strip() and response_ref is None:
                 await send_message(session, text=response_text)
@@ -869,13 +1128,27 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                                 # Warning doesn't fit, send separately
                                 await send_message(session, text=f"⚠️ {context_remaining:.0f}% context remaining")
 
-            # Clear client reference when done
-            session.client = None
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "Completed",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+        )
 
     except asyncio.CancelledError:
-        # Task was cancelled by interrupt_session - this is expected, not an error
+        # Hard cancel fallback - only happens if soft interrupt timed out
         if session.logger:
-            session.logger._write_log("Task cancelled by interrupt")
+            session.logger._write_log("Task hard-cancelled after timeout")
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "CancelledError",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+        )
+        # Notify user (SDK ack message wasn't received in time)
+        await send_message(session, text="_[interrupted by user]_")
         # Don't re-raise - we want clean termination
     except ProcessError as e:
         # Log stderr from CLI process
@@ -887,15 +1160,38 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         if e.stderr:
             error_msg += f"\nStderr: {e.stderr[:500]}"
         await send_message(session, text=error_msg)
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "ProcessError",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+            error=str(e),
+        )
     except Exception as e:
         error_msg = f"❌ Error: {str(e)}"
         await send_message(session, text=error_msg)
         if session.logger:
             session.logger.log_error("send_to_claude", e)
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "Exception",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+            error=str(e),
+        )
     finally:
         # Always clear references
         session.client = None
         session.current_task = None
+        _log_session_debug(
+            session,
+            "send_to_claude",
+            "End (cleanup)",
+            thread_id=thread_id,
+            elapsed_ms=int((time.perf_counter() - start_t) * 1000),
+        )
 
 
 async def send_or_edit_response(
@@ -1296,5 +1592,3 @@ def split_text(text: str, max_len: int = 4000) -> list[str]:
         text = text[split_pos:].lstrip()
 
     return chunks
-
-

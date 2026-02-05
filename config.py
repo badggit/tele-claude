@@ -5,6 +5,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- Dispatcher Config (shared across transports) ---
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+DISPATCHER_WORKERS = _env_int("DISPATCHER_WORKERS", 4)
+DISPATCHER_MAX_QUEUE = _env_int("DISPATCHER_MAX_QUEUE", 1000)
+DISPATCHER_QUEUE_WARN = _env_int("DISPATCHER_QUEUE_WARN", 200)
+
 # --- Telegram Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PROJECTS_DIR = Path(os.getenv("PROJECTS_DIR", Path.home() / "Projects"))
@@ -39,3 +50,7 @@ try:
     }
 except (json.JSONDecodeError, ValueError):
     DISCORD_CHANNEL_PROJECTS = {}
+
+# --- Task Injection API ---
+TASK_API_HOST = os.getenv("TASK_API_HOST", "127.0.0.1")
+TASK_API_PORT = _env_int("TASK_API_PORT", 9111)

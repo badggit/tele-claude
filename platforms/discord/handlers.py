@@ -5,6 +5,7 @@ Model: channel = project, thread = conversation (like Telegram forum topics).
 """
 
 import asyncio
+import time
 import logging
 import os
 import tempfile
@@ -12,6 +13,7 @@ from typing import Optional, Union
 
 import discord
 
+from dispatcher import dispatcher, DispatchItem
 from config import DISCORD_ALLOWED_GUILDS, DISCORD_CHANNEL_PROJECTS
 from session import sessions, start_session_discord, start_session_ambient_discord, start_claude_task, resolve_permission, interrupt_session, stop_session
 from utils import ensure_image_within_limits
@@ -57,12 +59,15 @@ def _is_general_channel(channel: discord.abc.Messageable) -> bool:
     return False
 
 
-async def handle_message(message: discord.Message, bot: discord.Client) -> None:
-    """Handle incoming Discord message.
+async def _send_queue_full_notice(message: discord.Message) -> None:
+    try:
+        await message.reply("Bot is busy. Please retry in a moment.")
+    except Exception as e:
+        logger.warning("Failed to send queue full notice: %s", e)
 
-    If message is in a project channel: create a thread and start session there.
-    If message is in a thread: continue session in that thread.
-    """
+
+async def handle_message(message: discord.Message, bot: discord.Client) -> None:
+    """Enqueue incoming Discord message for processing."""
     # Ignore bot messages
     if message.author.bot:
         return
@@ -73,6 +78,21 @@ async def handle_message(message: discord.Message, bot: discord.Client) -> None:
         logger.warning(f"Unauthorized message from guild {guild_id}")
         return
 
+    session_id = message.channel.id
+    dispatcher.enqueue(DispatchItem(
+        name="discord.message",
+        session_id=session_id,
+        coro=lambda: _handle_message_impl(message, bot),
+        on_drop=lambda: _send_queue_full_notice(message),
+    ))
+
+
+async def _handle_message_impl(message: discord.Message, bot: discord.Client) -> None:
+    """Handle incoming Discord message.
+
+    If message is in a project channel: create a thread and start session there.
+    If message is in a thread: continue session in that thread.
+    """
     text = message.content
     channel = message.channel
 
@@ -114,7 +134,16 @@ async def handle_message(message: discord.Message, bot: discord.Client) -> None:
                 prompt = f"{pending_image}\n\n{prompt}"
 
             # Interrupt ongoing query
+            t0 = time.perf_counter()
             was_interrupted = await interrupt_session(thread_id)
+            if session.logger:
+                session.logger.log_debug(
+                    "interrupt",
+                    "interrupt_session completed (message)",
+                    thread_id=thread_id,
+                    interrupted=was_interrupted,
+                    elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                )
             if was_interrupted:
                 await asyncio.sleep(0.1)
 
@@ -179,7 +208,7 @@ async def handle_message(message: discord.Message, bot: discord.Client) -> None:
 
 
 async def handle_attachment(message: discord.Message, bot: discord.Client) -> None:
-    """Handle message with image attachment."""
+    """Enqueue image attachment handling."""
     if message.author.bot:
         return
 
@@ -187,6 +216,17 @@ async def handle_attachment(message: discord.Message, bot: discord.Client) -> No
     if not is_authorized_guild(guild_id):
         return
 
+    session_id = message.channel.id
+    dispatcher.enqueue(DispatchItem(
+        name="discord.attachment",
+        session_id=session_id,
+        coro=lambda: _handle_attachment_impl(message, bot),
+        on_drop=lambda: _send_queue_full_notice(message),
+    ))
+
+
+async def _handle_attachment_impl(message: discord.Message, bot: discord.Client) -> None:
+    """Handle message with image attachment."""
     channel = message.channel
 
     # Find image attachment
@@ -206,7 +246,7 @@ async def handle_attachment(message: discord.Message, bot: discord.Client) -> No
     image_path = str(image_path)
 
     # Resize if needed to prevent API errors (max 2000px for multi-image requests)
-    image_path = ensure_image_within_limits(image_path)
+    image_path = await asyncio.to_thread(ensure_image_within_limits, image_path)
 
     caption = message.content or "What's in this image?"
 
@@ -271,7 +311,16 @@ async def handle_attachment(message: discord.Message, bot: discord.Client) -> No
     session = sessions[thread_id]
     prompt = f"{image_path}\n\n{caption}"
 
+    t0 = time.perf_counter()
     was_interrupted = await interrupt_session(thread_id)
+    if session.logger:
+        session.logger.log_debug(
+            "interrupt",
+            "interrupt_session completed (attachment)",
+            thread_id=thread_id,
+            interrupted=was_interrupted,
+            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+        )
     if was_interrupted:
         await asyncio.sleep(0.1)
 

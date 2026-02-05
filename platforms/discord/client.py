@@ -1,9 +1,16 @@
 """Discord platform client implementation.
 
 Wraps discord.py's interactions to implement PlatformClient protocol.
+
+IMPORTANT: Never wrap discord.py API calls in asyncio.wait_for().
+discord.py manages its own rate limit state with internal locks and events.
+Cancelling a request mid-flight (via wait_for timeout) can corrupt that state,
+leaving locks permanently held and deadlocking the entire HTTP pipeline.
+Let discord.py handle timeouts natively via max_ratelimit_timeout on the Client.
 """
 
 import asyncio
+import logging
 import time
 from io import BytesIO
 from typing import Optional, Protocol, runtime_checkable
@@ -13,9 +20,10 @@ import discord
 from ..protocol import ButtonRow, ButtonSpec, MessageRef, PlatformClient
 from .formatter import DiscordFormatter, split_text
 
+_log = logging.getLogger("tele-claude.discord.client")
 
 # Rate limiting constants
-MIN_SEND_INTERVAL = 0.5  # Discord is more lenient than Telegram
+MIN_SEND_INTERVAL = 1.0  # Minimum seconds between sends (prevent burst)
 TYPING_ACTION_INTERVAL = 8.0  # Discord typing lasts ~10 seconds
 
 
@@ -30,7 +38,7 @@ class ErrorLogger(Protocol):
 
 class DiscordClient(PlatformClient):
     """Discord implementation of PlatformClient protocol.
-    
+
     Handles:
     - Message sending/editing
     - Typing indicators
@@ -43,16 +51,10 @@ class DiscordClient(PlatformClient):
         channel: discord.TextChannel,
         logger: Optional[ErrorLogger] = None,
     ):
-        """Initialize Discord client.
-        
-        Args:
-            channel: Discord channel to send messages to
-            logger: Optional SessionLogger for error logging
-        """
         self._channel = channel
         self._logger = logger
         self._formatter = DiscordFormatter()
-        
+
         # Rate limiting state
         self._last_send = 0.0
         self._send_interval = MIN_SEND_INTERVAL
@@ -71,9 +73,9 @@ class DiscordClient(PlatformClient):
         """Convert ButtonRows to Discord View with buttons."""
         if not buttons:
             return None
-        
+
         view = discord.ui.View(timeout=None)  # No timeout for permission buttons
-        
+
         for row_idx, row in enumerate(buttons):
             for btn in row.buttons:
                 button = discord.ui.Button(
@@ -82,7 +84,7 @@ class DiscordClient(PlatformClient):
                     row=row_idx,
                 )
                 view.add_item(button)
-        
+
         return view
 
     async def _apply_rate_limit(self) -> None:
@@ -96,6 +98,7 @@ class DiscordClient(PlatformClient):
         """Log error if logger is available."""
         if self._logger:
             self._logger.log_error(context, error)
+        _log.warning("Discord API error [%s]: %s: %s", context, type(error).__name__, error)
 
     async def send_message(
         self,
@@ -114,7 +117,6 @@ class DiscordClient(PlatformClient):
         msg = None
 
         for i, chunk in enumerate(chunks):
-            # Only add view to last chunk
             is_last = i == len(chunks) - 1
             try:
                 if is_last and view:
@@ -122,8 +124,15 @@ class DiscordClient(PlatformClient):
                 else:
                     msg = await self._channel.send(content=chunk)
                 self._last_send = time.time()
+            except discord.RateLimited as e:
+                _log.warning("Rate limited on send_message: retry_after=%.1fs", e.retry_after)
+                self._log_error("send_message", e)
             except Exception as e:
                 self._log_error("send_message", e)
+
+            # Throttle between chunks to prevent burst
+            if not is_last:
+                await asyncio.sleep(MIN_SEND_INTERVAL)
 
         return MessageRef(platform_data=msg)
 
@@ -134,11 +143,7 @@ class DiscordClient(PlatformClient):
         *,
         buttons: Optional[list[ButtonRow]] = None,
     ) -> None:
-        """Edit an existing message.
-
-        Note: Caller (session.py send_or_edit_response) handles overflow/truncation.
-        Text should already be within max_message_length when this is called.
-        """
+        """Edit an existing message."""
         msg: Optional[discord.Message] = ref.platform_data
         if not msg:
             return
@@ -146,9 +151,13 @@ class DiscordClient(PlatformClient):
         view = self._build_view(buttons)
 
         try:
+            await self._apply_rate_limit()
             await msg.edit(content=text, view=view)
+            self._last_send = time.time()
+        except discord.RateLimited as e:
+            _log.warning("Rate limited on edit_message: retry_after=%.1fs", e.retry_after)
+            self._log_error("edit_message", e)
         except discord.NotFound:
-            # Message was deleted
             pass
         except Exception as e:
             self._log_error("edit_message", e)
@@ -161,8 +170,11 @@ class DiscordClient(PlatformClient):
 
         try:
             await msg.delete()
+        except discord.RateLimited as e:
+            _log.warning("Rate limited on delete_message: retry_after=%.1fs", e.retry_after)
+            self._log_error("delete_message", e)
         except discord.NotFound:
-            pass  # Already deleted
+            pass
         except Exception as e:
             self._log_error("delete_message", e)
 
@@ -175,6 +187,8 @@ class DiscordClient(PlatformClient):
         try:
             await self._channel.typing()
             self._last_typing = now
+        except discord.RateLimited as e:
+            _log.warning("Rate limited on send_typing: retry_after=%.1fs", e.retry_after)
         except Exception as e:
             self._log_error("send_typing", e)
 
@@ -185,10 +199,16 @@ class DiscordClient(PlatformClient):
     ) -> MessageRef:
         """Send a single image."""
         try:
+            await self._apply_rate_limit()
             image.seek(0)
             file = discord.File(image, filename="image.png")
             msg = await self._channel.send(content=caption, file=file)
+            self._last_send = time.time()
             return MessageRef(platform_data=msg)
+        except discord.RateLimited as e:
+            _log.warning("Rate limited on send_photo: retry_after=%.1fs", e.retry_after)
+            self._log_error("send_photo", e)
+            return MessageRef(platform_data=None)
         except Exception as e:
             self._log_error("send_photo", e)
             return MessageRef(platform_data=None)
@@ -202,14 +222,18 @@ class DiscordClient(PlatformClient):
             return
 
         try:
+            await self._apply_rate_limit()
             files = []
             for i, (img_buffer, caption) in enumerate(images):
                 img_buffer.seek(0)
                 files.append(discord.File(img_buffer, filename=f"image_{i}.png"))
-            
-            # Send all images in one message, with first caption as content
+
             content = images[0][1] if images else None
             await self._channel.send(content=content, files=files)
+            self._last_send = time.time()
+        except discord.RateLimited as e:
+            _log.warning("Rate limited on send_photos: retry_after=%.1fs", e.retry_after)
+            self._log_error("send_photos", e)
         except Exception as e:
             self._log_error("send_photos", e)
 
@@ -220,9 +244,15 @@ class DiscordClient(PlatformClient):
     ) -> MessageRef:
         """Send a file/document."""
         try:
+            await self._apply_rate_limit()
             file = discord.File(path)
             msg = await self._channel.send(content=caption, file=file)
+            self._last_send = time.time()
             return MessageRef(platform_data=msg)
+        except discord.RateLimited as e:
+            _log.warning("Rate limited on send_document: retry_after=%.1fs", e.retry_after)
+            self._log_error("send_document", e)
+            return MessageRef(platform_data=None)
         except Exception as e:
             self._log_error("send_document", e)
             return MessageRef(platform_data=None)
@@ -234,24 +264,25 @@ class DiscordClient(PlatformClient):
 
         await self._apply_rate_limit()
 
-        # Escape markdown in thinking text
         safe_text = self._formatter.escape_text(text)
 
-        # Truncate if needed (embed description limit is 4096)
         max_len = 4000
         if len(safe_text) > max_len:
             safe_text = safe_text[:max_len - 3] + "..."
 
-        # Create embed with grey sidebar for visual distinction
         embed = discord.Embed(
             description=f"🧠 {safe_text}",
-            color=discord.Color.greyple(),  # Muted grey color
+            color=discord.Color.greyple(),
         )
 
         try:
             msg = await self._channel.send(embed=embed)
             self._last_send = time.time()
             return MessageRef(platform_data=msg)
+        except discord.RateLimited as e:
+            _log.warning("Rate limited on send_thinking: retry_after=%.1fs", e.retry_after)
+            self._log_error("send_thinking", e)
+            return MessageRef(platform_data=None)
         except Exception as e:
             self._log_error("send_thinking", e)
             return MessageRef(platform_data=None)

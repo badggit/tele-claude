@@ -4,6 +4,7 @@ Telegram bot handlers for Claude Code bridge.
 Handles commands, callbacks, and message forwarding to Claude sessions.
 """
 import asyncio
+import time
 import os
 import tempfile
 from typing import Optional
@@ -17,6 +18,7 @@ import logging
 logger = logging.getLogger("tele-claude.handlers")
 
 from config import GENERAL_TOPIC_ID, ALLOWED_CHATS
+from dispatcher import dispatcher, DispatchItem
 from utils import get_project_folders, ensure_image_within_limits
 from session import sessions, start_session, start_session_ambient, start_claude_task, resolve_permission, interrupt_session
 from commands import get_command_prompt, get_help_message
@@ -35,6 +37,17 @@ def is_authorized_chat(chat_id: int | None) -> bool:
     if chat_id is None:
         return False
     return chat_id in ALLOWED_CHATS
+
+
+async def _send_queue_full_notice(bot, chat_id: int, thread_id: int | None) -> None:
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text="Bot is busy. Please retry in a moment.",
+        )
+    except Exception as e:
+        logger.warning("Failed to send queue full notice: %s", e)
 
 
 async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -272,7 +285,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photo messages - save to temp dir and send to Claude."""
+    """Enqueue photo message handling."""
     message = update.message
     if message is None or not message.photo:
         return
@@ -280,6 +293,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Authorization check
     if not is_authorized_chat(message.chat_id):
         logger.warning(f"Unauthorized photo from chat {message.chat_id}")
+        return
+
+    thread_id = message.message_thread_id
+    effective_thread_id = thread_id if thread_id else GENERAL_TOPIC_ID
+    dispatcher.enqueue(DispatchItem(
+        name="telegram.photo",
+        session_id=effective_thread_id,
+        coro=lambda: _handle_photo_impl(update, context),
+        on_drop=lambda: _send_queue_full_notice(context.bot, message.chat_id, thread_id),
+    ))
+
+
+async def _handle_photo_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle photo messages - save to temp dir and send to Claude."""
+    message = update.message
+    if message is None or not message.photo:
         return
 
     thread_id = message.message_thread_id
@@ -304,7 +333,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await file.download_to_drive(photo_path)
 
     # Resize if needed to prevent API errors (max 2000px for multi-image requests)
-    photo_path = ensure_image_within_limits(photo_path)
+    photo_path = await asyncio.to_thread(ensure_image_within_limits, photo_path)
 
     caption = message.caption
     if caption:
@@ -312,7 +341,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         prompt = f"{photo_path}\n\n{caption}"
 
         # Interrupt any ongoing query first
+        t0 = time.perf_counter()
         was_interrupted = await interrupt_session(effective_thread_id)
+        if session.logger:
+            session.logger.log_debug(
+                "interrupt",
+                "interrupt_session completed (photo)",
+                thread_id=effective_thread_id,
+                interrupted=was_interrupted,
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+            )
         if was_interrupted:
             await asyncio.sleep(0.1)
 
@@ -323,7 +361,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages and forward to Claude session if active."""
+    """Enqueue text message handling."""
     message = update.message
     if message is None:
         return
@@ -331,6 +369,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Authorization check
     if not is_authorized_chat(message.chat_id):
         logger.warning(f"Unauthorized message from chat {message.chat_id}")
+        return
+
+    thread_id = message.message_thread_id
+    text = message.text
+    if text is None:
+        return
+
+    effective_thread_id = thread_id if thread_id else GENERAL_TOPIC_ID
+    dispatcher.enqueue(DispatchItem(
+        name="telegram.message",
+        session_id=effective_thread_id,
+        coro=lambda: _handle_message_impl(update, context),
+        on_drop=lambda: _send_queue_full_notice(context.bot, message.chat_id, thread_id),
+    ))
+
+
+async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages and forward to Claude session if active."""
+    message = update.message
+    if message is None:
         return
 
     thread_id = message.message_thread_id
@@ -372,7 +430,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             prompt = f"{pending_image}\n\n{prompt}"
 
         # Interrupt any ongoing query first
+        t0 = time.perf_counter()
         was_interrupted = await interrupt_session(effective_thread_id)
+        if session.logger:
+            session.logger.log_debug(
+                "interrupt",
+                "interrupt_session completed (message)",
+                thread_id=effective_thread_id,
+                interrupted=was_interrupted,
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+            )
         if was_interrupted:
             # Small delay to let interrupt complete
             await asyncio.sleep(0.1)
