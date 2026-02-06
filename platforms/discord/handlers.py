@@ -7,14 +7,13 @@ Model: channel = project, thread = conversation (like Telegram forum topics).
 import asyncio
 import time
 import logging
-import os
 import tempfile
-from typing import Optional, Union
+from typing import Optional
 
 import discord
 
 from dispatcher import dispatcher, DispatchItem
-from config import DISCORD_ALLOWED_GUILDS, DISCORD_CHANNEL_PROJECTS
+from config import DISCORD_ALLOWED_GUILDS, PROJECTS_DIR
 from session import sessions, start_session_discord, start_session_ambient_discord, start_claude_task, resolve_permission, interrupt_session, stop_session
 from utils import ensure_image_within_limits
 from commands import get_command_prompt, get_help_message
@@ -31,19 +30,23 @@ def is_authorized_guild(guild_id: Optional[int]) -> bool:
     return guild_id in DISCORD_ALLOWED_GUILDS
 
 
-def get_project_for_channel(channel_id: int) -> Optional[str]:
-    """Get project directory for a channel from config.
+def _normalize_name(name: str) -> str:
+    """Normalize a name for matching: lowercase, replace _ and spaces with -."""
+    return name.lower().replace("_", "-").replace(" ", "-")
 
-    Returns None if channel is not mapped to a project.
+
+def resolve_project_for_channel(channel_name: str) -> Optional[str]:
+    """Resolve a project directory by matching channel name to a PROJECTS_DIR subfolder.
+
+    Returns the full path as string, or None if no match.
     """
-    return DISCORD_CHANNEL_PROJECTS.get(channel_id)
-
-
-def _get_parent_channel_id(channel: Union[discord.TextChannel, discord.Thread]) -> int:
-    """Get the parent channel ID (for threads) or the channel ID itself."""
-    if isinstance(channel, discord.Thread):
-        return channel.parent_id or channel.id
-    return channel.id
+    if not PROJECTS_DIR.exists():
+        return None
+    normalized = _normalize_name(channel_name)
+    for d in PROJECTS_DIR.iterdir():
+        if d.is_dir() and not d.name.startswith(".") and _normalize_name(d.name) == normalized:
+            return str(d)
+    return None
 
 
 def _is_general_channel(channel: discord.abc.Messageable) -> bool:
@@ -100,7 +103,7 @@ async def _handle_message_impl(message: discord.Message, bot: discord.Client) ->
     if isinstance(channel, discord.Thread):
         # Message is in a thread - use thread ID as session key
         thread_id = channel.id
-        parent_channel_id = channel.parent_id or channel.id
+        parent_channel_name = channel.parent.name if channel.parent else None
 
         # Check if this thread has an active session
         if thread_id in sessions:
@@ -152,7 +155,7 @@ async def _handle_message_impl(message: discord.Message, bot: discord.Client) ->
             return
 
         # No session in this thread - check if parent channel is a project channel or #general
-        project_path = get_project_for_channel(parent_channel_id)
+        project_path = resolve_project_for_channel(parent_channel_name) if parent_channel_name else None
         if project_path:
             # Start new session in this thread
             success = await start_session_discord(thread_id, project_path, channel)
@@ -170,8 +173,7 @@ async def _handle_message_impl(message: discord.Message, bot: discord.Client) ->
         return
 
     # Message is in a channel (not a thread)
-    channel_id = channel.id
-    project_path = get_project_for_channel(channel_id)
+    project_path = resolve_project_for_channel(channel.name) if isinstance(channel, discord.TextChannel) else None
 
     if project_path:
         # Create a new thread for this conversation
@@ -252,8 +254,7 @@ async def _handle_attachment_impl(message: discord.Message, bot: discord.Client)
 
     # If in a channel, create a thread first
     if not isinstance(channel, discord.Thread):
-        channel_id = channel.id
-        project_path = get_project_for_channel(channel_id)
+        project_path = resolve_project_for_channel(channel.name) if isinstance(channel, discord.TextChannel) else None
 
         if project_path:
             thread_name = caption[:100] if caption else "Image analysis"
@@ -291,11 +292,11 @@ async def _handle_attachment_impl(message: discord.Message, bot: discord.Client)
 
     # In a thread - use existing session or start new one
     thread_id = channel.id
-    parent_channel_id = channel.parent_id or channel.id
+    parent_channel_name = channel.parent.name if channel.parent else None
 
     if thread_id not in sessions:
         # Start session if parent is a project channel or #general
-        project_path = get_project_for_channel(parent_channel_id)
+        project_path = resolve_project_for_channel(parent_channel_name) if parent_channel_name else None
         if project_path:
             success = await start_session_discord(thread_id, project_path, channel)
             if not success:

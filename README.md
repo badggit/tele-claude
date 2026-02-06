@@ -92,11 +92,12 @@ Every new topic auto-starts a session in that directory. Useful for running sepa
 ```bash
 # Add to .env
 echo "DISCORD_BOT_TOKEN=your_discord_token" >> .env
-echo 'DISCORD_CHANNEL_PROJECTS={"channel_id": "/path/to/project"}' >> .env
 
 # Run
 python main.py discord
 ```
+
+Channels are automatically matched to project folders in `~/Projects` by name (e.g. channel `my-app` matches folder `my_app` or `my-app`).
 
 ## Browser Automation
 
@@ -139,7 +140,6 @@ If no CDP endpoint is configured, the bot launches its own Chromium instance wit
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `DISCORD_BOT_TOKEN` | Yes | - | Discord bot token |
-| `DISCORD_CHANNEL_PROJECTS` | No | `{}` | JSON mapping channel IDs to project paths |
 | `DISCORD_ALLOWED_GUILDS` | No | - | Comma-separated guild IDs to allow |
 
 ### Browser
