@@ -10,7 +10,7 @@ import time
 import discord
 from discord import Intents
 
-from config import DISCORD_BOT_TOKEN, DISCORD_CHANNEL_PROJECTS
+from config import DISCORD_BOT_TOKEN
 from platforms.discord.handlers import handle_message, handle_attachment, handle_interaction
 from logger import setup_logging
 
@@ -149,7 +149,6 @@ class ClaudeBotClient(discord.Client):
 
     async def on_ready(self) -> None:
         _log.info(f"Discord bot logged in as {self.user}")
-        _log.info(f"Configured channel mappings: {DISCORD_CHANNEL_PROJECTS}")
         if self._defer_task_factory and not self._task_factory_registered:
             self._defer_task_factory = False
             await self._register_task_factory()
@@ -196,9 +195,6 @@ def run() -> None:
 
     if not DISCORD_BOT_TOKEN:
         raise ValueError("DISCORD_BOT_TOKEN not found in environment")
-
-    if not DISCORD_CHANNEL_PROJECTS:
-        _log.warning("No DISCORD_CHANNEL_PROJECTS configured - bot won't auto-start sessions")
 
     # Set up intents
     intents = Intents.default()

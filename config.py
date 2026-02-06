@@ -1,4 +1,3 @@
-import json
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -39,17 +38,6 @@ DISCORD_ALLOWED_GUILDS: set[int] = {
     int(gid.strip()) for gid in _discord_guilds_str.split(",") if gid.strip()
 }
 
-# Discord channel -> project directory mapping
-# Set via DISCORD_CHANNEL_PROJECTS env var as JSON: {"channel_id": "/path/to/project"}
-# Example: DISCORD_CHANNEL_PROJECTS={"123456789": "/Users/me/Projects/myapp"}
-_discord_projects_str = os.getenv("DISCORD_CHANNEL_PROJECTS", "{}")
-try:
-    _discord_projects_raw = json.loads(_discord_projects_str)
-    DISCORD_CHANNEL_PROJECTS: dict[int, str] = {
-        int(k): v for k, v in _discord_projects_raw.items()
-    }
-except (json.JSONDecodeError, ValueError):
-    DISCORD_CHANNEL_PROJECTS = {}
 
 # --- Task Injection API ---
 TASK_API_HOST = os.getenv("TASK_API_HOST", "127.0.0.1")
