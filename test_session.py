@@ -10,7 +10,7 @@ from session import (
     MODEL_CONTEXT_WINDOWS,
     CONTEXT_WARNING_THRESHOLD,
 )
-from platforms import MessageRef
+from platforms import MessageRef, TextMessage
 
 
 class TestCalculateContextRemaining:
@@ -186,8 +186,10 @@ class TestSendOrEditResponse:
         # Should send the overflow portion only
         mock_platform.send_message.assert_called_once()
         call_args = mock_platform.send_message.call_args
+        sent_message = call_args[0][0] if call_args[0] else call_args[1].get('message')
+        assert isinstance(sent_message, TextMessage)
         # Check that the text contains the overflow content (b's)
-        assert "b" in str(call_args)
+        assert "b" in sent_message.text
 
     @pytest.mark.asyncio
     async def test_first_message_over_4000_truncates(self, mock_session, mock_platform):
@@ -259,8 +261,9 @@ class TestSendOrEditResponse:
         # send_message should receive full text (it handles splitting via split_text)
         mock_platform.send_message.assert_called_once()
         call_args = mock_platform.send_message.call_args
-        sent_text = call_args[0][0] if call_args[0] else call_args[1].get('text', '')
-        assert len(sent_text) == 5000  # Full text, not truncated
+        sent_message = call_args[0][0] if call_args[0] else call_args[1].get('message')
+        assert isinstance(sent_message, TextMessage)
+        assert len(sent_message.text) == 5000  # Full text, not truncated
 
     @pytest.mark.asyncio
     async def test_edit_existing_over_max_truncates(self, mock_session, mock_platform, mock_message_ref):
@@ -274,15 +277,16 @@ class TestSendOrEditResponse:
         # edit_message should receive truncated text
         mock_platform.edit_message.assert_called_once()
         call_args = mock_platform.edit_message.call_args
-        sent_text = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get('text', '')
-        assert len(sent_text) < 5000  # Truncated
-        assert sent_text.endswith("...")  # Has truncation marker
+        sent_message = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get('message')
+        assert isinstance(sent_message, TextMessage)
+        assert len(sent_message.text) < 5000  # Truncated
+        assert sent_message.text.endswith("...")  # Has truncation marker
 
     @pytest.mark.asyncio
     async def test_discord_2000_char_limit(self, mock_session):
         """Test with Discord's 2000 char limit."""
         # Create mock platform with Discord's limit
-        mock_platform = MagicMock()
+        mock_platform = AsyncMock()
         mock_platform.max_message_length = 2000
         mock_session.get_platform.return_value = mock_platform
 
@@ -295,9 +299,10 @@ class TestSendOrEditResponse:
 
         # Should truncate to ~1990 chars
         call_args = mock_platform.edit_message.call_args
-        sent_text = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get('text', '')
-        assert len(sent_text) <= 2000
-        assert sent_text.endswith("...")
+        sent_message = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get('message')
+        assert isinstance(sent_message, TextMessage)
+        assert len(sent_message.text) <= 2000
+        assert sent_message.text.endswith("...")
 
     @pytest.mark.asyncio
     async def test_message_ref_without_platform_data_sends_new(self, mock_session, mock_platform):

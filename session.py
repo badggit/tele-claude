@@ -35,7 +35,17 @@ from commands import load_contextual_commands, register_commands_for_chat
 from mcp_tools import create_telegram_mcp_server
 
 # Platform abstraction imports
-from platforms import PlatformClient, MessageFormatter, ButtonSpec, ButtonRow, MessageRef
+from platforms import (
+    PlatformClient,
+    MessageFormatter,
+    ButtonSpec,
+    ButtonRow,
+    MessageRef,
+    TextMessage,
+    ToolCallMessage,
+    ThinkingMessage,
+    PlatformMessage,
+)
 from platforms.telegram import TelegramClient, TelegramFormatter
 
 # Check if Discord support is available
@@ -73,6 +83,68 @@ ALLOWLIST_FILE = Path(__file__).parent / "tool_allowlist.json"
 
 # Pending permission requests: request_id -> (Future, SessionLogger)
 pending_permissions: dict[str, tuple[asyncio.Future, Optional["SessionLogger"]]] = {}
+
+
+def md_inline_code(text: str) -> str:
+    """Wrap text in markdown inline code, using a safe backtick fence."""
+    safe = text.replace("\n", " ")
+    fence = "`"
+    while fence in safe:
+        fence += "`"
+    return f"{fence}{safe}{fence}"
+
+
+def md_code_block(text: str, language: Optional[str] = None) -> str:
+    """Wrap text in a markdown code block with a safe backtick fence."""
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    lang = language or ""
+    return f"{fence}{lang}\n{text}\n{fence}"
+
+
+def md_blockquote(text: str) -> str:
+    """Wrap text in markdown blockquote lines."""
+    if not text:
+        return ""
+    return "\n".join(f"> {line}" for line in text.splitlines())
+
+
+def md_escape(text: str) -> str:
+    """Escape markdown-sensitive characters."""
+    escape_map = {
+        "\\": "\\\\",
+        "`": "\\`",
+        "*": "\\*",
+        "_": "\\_",
+        "{": "\\{",
+        "}": "\\}",
+        "[": "\\[",
+        "]": "\\]",
+        "(": "\\(",
+        ")": "\\)",
+        "#": "\\#",
+        "+": "\\+",
+        "-": "\\-",
+        ".": "\\.",
+        "!": "\\!",
+        "@": "\\@",
+        "|": "\\|",
+        ">": "\\>",
+        "~": "\\~",
+    }
+    return "".join(escape_map.get(ch, ch) for ch in text)
+
+
+def is_empty_message(message: PlatformMessage) -> bool:
+    """Check whether a structured message has displayable content."""
+    if isinstance(message, TextMessage):
+        return not message.text.strip()
+    if isinstance(message, ThinkingMessage):
+        return not message.text.strip()
+    if isinstance(message, ToolCallMessage):
+        return not message.calls
+    return True
 
 
 def _log_session_debug(session: Optional["ClaudeSession"], context: str, message: str, **kwargs: Any) -> None:
@@ -303,8 +375,6 @@ async def request_tool_permission(
             session.logger.log_error("request_tool_permission", Exception("No platform client available"))
         return False
 
-    formatter = session.get_formatter()
-
     # Generate unique request ID
     request_id = str(uuid.uuid4())[:8]
 
@@ -314,14 +384,16 @@ async def request_tool_permission(
         v_str = str(v)
         if len(v_str) > 100:
             v_str = v_str[:100] + "..."
-        v_str = formatter.escape_text(v_str)
-        input_preview.append(f"  {formatter.code(k)}: {v_str}")
-    input_text = "\n".join(input_preview) if input_preview else "  (no arguments)"
+        input_preview.append(f"{k}: {v_str}")
 
-    # Build message text using formatter
+    if input_preview:
+        input_text = md_code_block("\n".join(input_preview))
+    else:
+        input_text = "(no arguments)"
+
     message_text = (
-        f"🔐 {formatter.bold('Permission Request')}\n\n"
-        f"Tool: {formatter.code(tool_name)}\n"
+        f"🔐 **Permission Request**\n\n"
+        f"Tool: {md_inline_code(tool_name)}\n"
         f"Arguments:\n{input_text}"
     )
 
@@ -337,7 +409,7 @@ async def request_tool_permission(
     ]
 
     # Send permission request message
-    await platform.send_message(message_text, buttons=buttons)
+    await platform.send_message(TextMessage(message_text), buttons=buttons)
 
     # Log the permission request
     if session.logger:
@@ -363,7 +435,7 @@ async def request_tool_permission(
         if session.logger:
             session.logger.log_debug("permission", "Request timed out", request_id=request_id)
         if platform:
-            await platform.send_message("⏰ Permission request timed out (denied)")
+            await platform.send_message(TextMessage("⏰ Permission request timed out (denied)"))
         return False
 
 
@@ -423,11 +495,11 @@ def create_pre_compact_hook(session: ClaudeSession):
             # Notify user in chat using platform abstraction
             platform = session.get_platform()
             if platform:
-                formatter = session.get_formatter()
-                await platform.send_message(
-                    f"📦 {formatter.bold('Context compacting...')}\n"
+                message_text = (
+                    "📦 **Context compacting...**\n"
                     "Conversation history is being summarized to free up space."
                 )
+                await platform.send_message(TextMessage(message_text))
         except Exception as e:
             if session.logger:
                 session.logger.log_error("pre_compact_hook", e)
@@ -557,7 +629,9 @@ async def _start_session_impl(
     await register_commands_for_chat(bot, chat_id, contextual_commands)
 
     # Send welcome message using platform
-    await platform.send_message(f"Claude session started in {formatter.code(display_name)}")
+    await platform.send_message(
+        TextMessage(f"Claude session started in {md_inline_code(display_name)}")
+    )
 
     return True
 
@@ -644,7 +718,9 @@ async def start_session_discord(channel_id: int, project_path: str, channel: Any
     )
 
     # Send welcome message
-    await platform.send_message(f"Claude session started in `{display_name}`")
+    await platform.send_message(
+        TextMessage(f"Claude session started in {md_inline_code(display_name)}")
+    )
 
     return True
 
@@ -774,30 +850,26 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
     current_model: Optional[str] = None
     last_usage: Optional[dict] = None
 
-    def format_current_tool_buffer() -> str:
-        """Format current tool buffer contents using session formatter."""
-        formatter = session.get_formatter()
-        if len(tool_buffer) == 1:
-            name, input_dict = tool_buffer[0]
-            return formatter.format_tool_call(name, input_dict)
-        else:
-            return formatter.format_tool_calls_batch(tool_buffer_name or "Tool", tool_buffer)
+    def build_tool_buffer_message() -> ToolCallMessage:
+        """Build a structured tool call message for the current buffer."""
+        tool_name = tool_buffer_name or (tool_buffer[0][0] if tool_buffer else "Tool")
+        return ToolCallMessage(tool_name=tool_name, calls=list(tool_buffer))
 
     async def update_tool_buffer_message():
         """Send or edit the tool buffer message."""
         nonlocal tool_buffer_ref
-        text = format_current_tool_buffer()
+        message = build_tool_buffer_message()
 
         if tool_buffer_ref and tool_buffer_ref.platform_data:
             # Edit existing message
             try:
-                await platform.edit_message(tool_buffer_ref, text)
+                await platform.edit_message(tool_buffer_ref, message)
             except Exception as e:
                 if session.logger and "message is not modified" not in str(e).lower():
                     session.logger.log_error("update_tool_buffer_message", e)
         else:
             # Send new message
-            tool_buffer_ref = await send_message(session, text=text)
+            tool_buffer_ref = await send_message(session, message=message)
 
     async def flush_tool_buffer():
         """Clear tool buffer state (message already sent/edited)."""
@@ -894,7 +966,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                         if isinstance(content, str) and "interrupted" in content.lower():
                             # Display the interrupt message and exit
                             _log_session_debug(session, "interrupt", "SDK interrupt ack (UserMessage)", thread_id=thread_id)
-                            await send_message(session, text=f"_{content}_")
+                            await send_message(session, message=TextMessage(f"_{content}_"))
                             break
                     elif isinstance(message, ResultMessage):
                         # Capture session metadata before exiting
@@ -930,7 +1002,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                     # API errors — display before subagent check (user should see rate limits from subagents)
                     if message.error:
                         error_label = message.error.replace("_", " ").title()
-                        await send_message(session, text=f"⚠️ API error: {error_label}")
+                        await send_message(session, message=TextMessage(f"⚠️ API error: {error_label}"))
 
                     is_subagent = message.parent_tool_use_id is not None
 
@@ -941,8 +1013,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
 
                             if is_subagent:
                                 await flush_tool_buffer()
-                                fmt = session.get_formatter()
-                                await send_message(session, text=fmt.blockquote(block.text))
+                                await send_message(session, message=TextMessage(md_blockquote(block.text)))
                             else:
                                 await flush_tool_buffer()
                                 response_text += block.text
@@ -1009,7 +1080,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
 
                                 thinking_text = block.thinking
                                 if thinking_text:
-                                    await platform.send_thinking(thinking_text)
+                                    await send_message(session, message=ThinkingMessage(thinking_text))
 
                         elif isinstance(block, ToolResultBlock):
                             # Only display error results — successful tool output is noise
@@ -1020,12 +1091,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                                     await flush_tool_buffer()
                                     output = format_tool_output(text)
                                     if output:
-                                        fmt = session.get_formatter()
-                                        safe = fmt.escape_text(output)
                                         if is_subagent:
-                                            await send_message(session, text=fmt.blockquote(safe))
+                                            await send_message(session, message=TextMessage(md_blockquote(md_escape(output))))
                                         else:
-                                            await send_message(session, text=fmt.code_block(safe))
+                                            await send_message(session, message=TextMessage(md_code_block(output)))
 
                 # Branch 3: UserMessage (content is str | list[ContentBlock])
                 elif isinstance(message, UserMessage):
@@ -1046,12 +1115,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                                     text = _extract_tool_result_text(block)
                                     output = format_tool_output(text) if text else None
                                     if output:
-                                        fmt = session.get_formatter()
-                                        safe = fmt.escape_text(output)
                                         if is_subagent:
-                                            await send_message(session, text=fmt.blockquote(safe))
+                                            await send_message(session, message=TextMessage(md_blockquote(md_escape(output))))
                                         else:
-                                            await send_message(session, text=fmt.code_block(safe))
+                                            await send_message(session, message=TextMessage(md_code_block(output)))
                                 await send_typing_action(session)
 
                             elif isinstance(block, TextBlock):
@@ -1068,7 +1135,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                     # Surface session-level errors
                     if message.is_error:
                         error_text = message.result or "Session ended with an error"
-                        await send_message(session, text=f"⚠️ {error_text}")
+                        await send_message(session, message=TextMessage(f"⚠️ {error_text}"))
 
                     cost = message.total_cost_usd
                     duration = message.duration_ms
@@ -1092,7 +1159,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
             # Flush any remaining buffers (after loop)
             await flush_tool_buffer()
             if response_text.strip() and response_ref is None:
-                await send_message(session, text=response_text)
+                await send_message(session, message=TextMessage(response_text))
 
             # Send diff images as media group (gallery)
             if diff_images:
@@ -1120,13 +1187,13 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                                 current_msg_text = response_text[-response_msg_text_len:] if len(response_text) > response_msg_text_len else response_text
                                 warning_text = current_msg_text + warning
                                 try:
-                                    await platform.edit_message(response_ref, warning_text)
+                                    await platform.edit_message(response_ref, TextMessage(warning_text))
                                 except Exception:
                                     # Edit failed, send as separate message
-                                    await send_message(session, text=f"⚠️ {context_remaining:.0f}% context remaining")
+                                    await send_message(session, message=TextMessage(f"⚠️ {context_remaining:.0f}% context remaining"))
                             else:
                                 # Warning doesn't fit, send separately
-                                await send_message(session, text=f"⚠️ {context_remaining:.0f}% context remaining")
+                                await send_message(session, message=TextMessage(f"⚠️ {context_remaining:.0f}% context remaining"))
 
         _log_session_debug(
             session,
@@ -1148,7 +1215,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
             elapsed_ms=int((time.perf_counter() - start_t) * 1000),
         )
         # Notify user (SDK ack message wasn't received in time)
-        await send_message(session, text="_[interrupted by user]_")
+        await send_message(session, message=TextMessage("_[interrupted by user]_"))
         # Don't re-raise - we want clean termination
     except ProcessError as e:
         # Log stderr from CLI process
@@ -1159,7 +1226,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         error_msg = f"❌ Error: {str(e)}"
         if e.stderr:
             error_msg += f"\nStderr: {e.stderr[:500]}"
-        await send_message(session, text=error_msg)
+        await send_message(session, message=TextMessage(error_msg))
         _log_session_debug(
             session,
             "send_to_claude",
@@ -1170,7 +1237,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         )
     except Exception as e:
         error_msg = f"❌ Error: {str(e)}"
-        await send_message(session, text=error_msg)
+        await send_message(session, message=TextMessage(error_msg))
         if session.logger:
             session.logger.log_error("send_to_claude", e)
         _log_session_debug(
@@ -1233,7 +1300,11 @@ async def send_or_edit_response(
         last_len = 0
 
         for chunk in chunks:
-            new_ref = await _send_with_fallback(session, text=chunk, existing_ref=None)
+            new_ref = await _send_with_fallback(
+                session,
+                message=TextMessage(chunk),
+                existing_ref=None,
+            )
             if new_ref:
                 last_ref = new_ref
                 last_len = len(chunk)
@@ -1246,7 +1317,11 @@ async def send_or_edit_response(
     if existing_ref and existing_ref.platform_data and len(display_text) > max_len:
         display_text = display_text[:max_len - 10] + "\n..."
 
-    result_ref = await _send_with_fallback(session, text=display_text, existing_ref=existing_ref)
+    result_ref = await _send_with_fallback(
+        session,
+        message=TextMessage(display_text),
+        existing_ref=existing_ref,
+    )
     if result_ref:
         return result_ref, len(display_text) if len(display_text) <= max_len else max_len
     return existing_ref, msg_text_len
@@ -1255,7 +1330,7 @@ async def send_or_edit_response(
 async def _send_with_fallback(
     session: ClaudeSession,
     bot: Optional[Bot] = None,
-    text: str = "",
+    message: Optional[PlatformMessage] = None,
     existing_ref: Optional[MessageRef] = None,
     max_retries: int = 3
 ) -> Optional[MessageRef]:
@@ -1266,23 +1341,26 @@ async def _send_with_fallback(
     Args:
         session: The Claude session
         bot: Deprecated, ignored - uses session.get_platform()
-        text: Text to send (markdown format, will be converted)
+        message: Structured message payload (platform formats content)
         existing_ref: Existing message ref to edit, or None to send new
         max_retries: Retry attempts (handled by platform)
 
     Returns:
         MessageRef if successful, None otherwise
     """
+    if message is None:
+        return None
+
     platform = session.get_platform()
     if not platform:
         return None
 
     try:
         if existing_ref and existing_ref.platform_data:
-            await platform.edit_message(existing_ref, text)
+            await platform.edit_message(existing_ref, message)
             return existing_ref
         else:
-            return await platform.send_message(text)
+            return await platform.send_message(message)
     except Exception as e:
         error_str = str(e).lower()
         # "message is not modified" is not an error
@@ -1296,7 +1374,7 @@ async def _send_with_fallback(
 async def send_message(
     session: ClaudeSession,
     bot: Optional[Bot] = None,
-    text: str = "",
+    message: Optional[PlatformMessage] = None,
     parse_mode: Optional[str] = None
 ) -> Optional[MessageRef]:
     """Send a new message using platform abstraction.
@@ -1304,13 +1382,13 @@ async def send_message(
     Args:
         session: The Claude session
         bot: Deprecated, ignored - uses session.get_platform()
-        text: Text to send (will be converted to platform format)
+        message: Structured message payload (platform formats content)
         parse_mode: Deprecated, ignored - platform handles formatting
 
     Returns:
         MessageRef for later editing, or None if send failed
     """
-    if not text.strip():
+    if message is None or is_empty_message(message):
         return None
 
     platform = session.get_platform()
@@ -1318,7 +1396,7 @@ async def send_message(
         return None
 
     # Platform client handles rate limiting internally
-    return await platform.send_message(text)
+    return await platform.send_message(message)
 
 
 async def send_typing_action(session: ClaudeSession, bot: Optional[Bot] = None) -> None:

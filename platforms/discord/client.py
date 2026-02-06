@@ -17,7 +17,15 @@ from typing import Optional, Protocol, runtime_checkable
 
 import discord
 
-from ..protocol import ButtonRow, ButtonSpec, MessageRef, PlatformClient
+from ..protocol import (
+    ButtonRow,
+    MessageRef,
+    PlatformClient,
+    PlatformMessage,
+    TextMessage,
+    ToolCallMessage,
+    ThinkingMessage,
+)
 from .formatter import DiscordFormatter, split_text
 
 _log = logging.getLogger("tele-claude.discord.client")
@@ -100,18 +108,59 @@ class DiscordClient(PlatformClient):
             self._logger.log_error(context, error)
         _log.warning("Discord API error [%s]: %s: %s", context, type(error).__name__, error)
 
+    def _render_tool_call(self, message: ToolCallMessage) -> str:
+        """Render tool call(s) to Discord markdown."""
+        if not message.calls:
+            return self._formatter.format_tool_calls_batch(message.tool_name, [])
+        if len(message.calls) == 1:
+            name, args = message.calls[0]
+            return self._formatter.format_tool_call(name, args)
+        return self._formatter.format_tool_calls_batch(message.tool_name, message.calls)
+
+    def _render_message(self, message: PlatformMessage) -> str:
+        """Render a platform message to Discord markdown."""
+        if isinstance(message, TextMessage):
+            return self._formatter.format_markdown(message.text)
+        if isinstance(message, ToolCallMessage):
+            return self._render_tool_call(message)
+        if isinstance(message, ThinkingMessage):
+            return message.text
+        raise TypeError(f"Unsupported message type: {type(message).__name__}")
+
+    def _build_thinking_embed(self, text: str) -> discord.Embed:
+        """Build a thinking embed with safe text."""
+        safe_text = self._formatter.escape_text(text)
+        max_len = 4000
+        if len(safe_text) > max_len:
+            safe_text = safe_text[:max_len - 3] + "..."
+        return discord.Embed(
+            description=f"🧠 {safe_text}",
+            color=discord.Color.greyple(),
+        )
+
     async def send_message(
         self,
-        text: str,
+        message: PlatformMessage,
         *,
         buttons: Optional[list[ButtonRow]] = None,
     ) -> MessageRef:
         """Send a new message with optional buttons."""
-        if not text.strip():
+        if isinstance(message, TextMessage):
+            if not message.text.strip():
+                return MessageRef(platform_data=None)
+        elif isinstance(message, ThinkingMessage):
+            if not message.text.strip():
+                return MessageRef(platform_data=None)
+            return await self.send_thinking(message.text)
+        elif isinstance(message, ToolCallMessage):
+            if not message.calls:
+                return MessageRef(platform_data=None)
+        else:
             return MessageRef(platform_data=None)
 
         await self._apply_rate_limit()
 
+        text = self._render_message(message)
         chunks = split_text(text, self.max_message_length)
         view = self._build_view(buttons)
         msg = None
@@ -139,7 +188,7 @@ class DiscordClient(PlatformClient):
     async def edit_message(
         self,
         ref: MessageRef,
-        text: str,
+        message: PlatformMessage,
         *,
         buttons: Optional[list[ButtonRow]] = None,
     ) -> None:
@@ -152,7 +201,12 @@ class DiscordClient(PlatformClient):
 
         try:
             await self._apply_rate_limit()
-            await msg.edit(content=text, view=view)
+            if isinstance(message, ThinkingMessage):
+                embed = self._build_thinking_embed(message.text)
+                await msg.edit(embed=embed, content=None, view=view)
+            else:
+                content = self._render_message(message)
+                await msg.edit(content=content, view=view)
             self._last_send = time.time()
         except discord.RateLimited as e:
             _log.warning("Rate limited on edit_message: retry_after=%.1fs", e.retry_after)
@@ -264,16 +318,7 @@ class DiscordClient(PlatformClient):
 
         await self._apply_rate_limit()
 
-        safe_text = self._formatter.escape_text(text)
-
-        max_len = 4000
-        if len(safe_text) > max_len:
-            safe_text = safe_text[:max_len - 3] + "..."
-
-        embed = discord.Embed(
-            description=f"🧠 {safe_text}",
-            color=discord.Color.greyple(),
-        )
+        embed = self._build_thinking_embed(text)
 
         try:
             msg = await self._channel.send(embed=embed)
