@@ -6,6 +6,10 @@ from .protocol import (
     MessageRef,
     PlatformClient,
     MessageFormatter,
+    TextMessage,
+    ToolCallMessage,
+    ThinkingMessage,
+    PlatformMessage,
 )
 
 __all__ = [
@@ -14,4 +18,8 @@ __all__ = [
     "MessageRef",
     "PlatformClient",
     "MessageFormatter",
+    "TextMessage",
+    "ToolCallMessage",
+    "ThinkingMessage",
+    "PlatformMessage",
 ]

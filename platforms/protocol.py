@@ -6,7 +6,7 @@ Uses Python's Protocol for structural typing (duck typing with type hints).
 
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable, Union
 
 
 @dataclass
@@ -33,6 +33,28 @@ class MessageRef:
     platform_data: Any
 
 
+@dataclass
+class TextMessage:
+    """Plain text message content (markdown source)."""
+    text: str
+
+
+@dataclass
+class ToolCallMessage:
+    """Structured tool call(s) for platform-specific formatting."""
+    tool_name: str
+    calls: list[tuple[str, dict[str, Any]]]
+
+
+@dataclass
+class ThinkingMessage:
+    """Thinking/reasoning content for platform-specific styling."""
+    text: str
+
+
+PlatformMessage = Union[TextMessage, ToolCallMessage, ThinkingMessage]
+
+
 @runtime_checkable
 class PlatformClient(Protocol):
     """Abstract messaging operations across platforms.
@@ -54,14 +76,14 @@ class PlatformClient(Protocol):
 
     async def send_message(
         self,
-        text: str,
+        message: PlatformMessage,
         *,
         buttons: Optional[list[ButtonRow]] = None,
     ) -> MessageRef:
         """Send a new message to the active channel/thread.
 
         Args:
-            text: Message content (already formatted for platform)
+            message: Message payload (platform formats content)
             buttons: Optional keyboard buttons
 
         Returns:
@@ -72,7 +94,7 @@ class PlatformClient(Protocol):
     async def edit_message(
         self,
         ref: MessageRef,
-        text: str,
+        message: PlatformMessage,
         *,
         buttons: Optional[list[ButtonRow]] = None,
     ) -> None:
@@ -80,7 +102,7 @@ class PlatformClient(Protocol):
 
         Args:
             ref: Message reference from send_message
-            text: New message content
+            message: New message payload (platform formats content)
             buttons: Optional updated keyboard
         """
         ...

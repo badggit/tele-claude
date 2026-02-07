@@ -13,8 +13,16 @@ from typing import Optional, Protocol, runtime_checkable
 from telegram import Bot, InputMediaPhoto, Message
 from telegram.constants import ChatAction
 
-from ..protocol import ButtonRow, ButtonSpec, MessageRef, PlatformClient
-from .formatter import TelegramFormatter, markdown_to_html, split_text, strip_html_tags
+from ..protocol import (
+    ButtonRow,
+    MessageRef,
+    PlatformClient,
+    PlatformMessage,
+    TextMessage,
+    ToolCallMessage,
+    ThinkingMessage,
+)
+from .formatter import TelegramFormatter, split_text, strip_html_tags
 
 
 @runtime_checkable
@@ -117,20 +125,56 @@ class TelegramClient(PlatformClient):
         if self._logger:
             self._logger.log_error(context, error)
 
+    def _render_tool_call(self, message: ToolCallMessage) -> str:
+        """Render tool call(s) to Telegram HTML."""
+        if not message.calls:
+            return self._formatter.format_tool_calls_batch(message.tool_name, [])
+        if len(message.calls) == 1:
+            name, args = message.calls[0]
+            return self._formatter.format_tool_call(name, args)
+        return self._formatter.format_tool_calls_batch(message.tool_name, message.calls)
+
+    def _format_thinking_html(self, text: str) -> str:
+        """Format thinking text as Telegram HTML."""
+        safe_text = self._formatter.escape_text(text)
+        max_len = self.max_message_length - 20  # Room for emoji and tags
+        if len(safe_text) > max_len:
+            safe_text = safe_text[:max_len - 3] + "..."
+        return f"🧠 <i>{safe_text}</i>"
+
+    def _render_message(self, message: PlatformMessage) -> str:
+        """Render a platform message to Telegram HTML."""
+        if isinstance(message, TextMessage):
+            return self._formatter.format_markdown(message.text)
+        if isinstance(message, ToolCallMessage):
+            return self._render_tool_call(message)
+        if isinstance(message, ThinkingMessage):
+            return self._format_thinking_html(message.text)
+        raise TypeError(f"Unsupported message type: {type(message).__name__}")
+
     async def send_message(
         self,
-        text: str,
+        message: PlatformMessage,
         *,
         buttons: Optional[list[ButtonRow]] = None,
     ) -> MessageRef:
         """Send a new message with rate limiting and chunking."""
-        if not text.strip():
+        if isinstance(message, TextMessage):
+            if not message.text.strip():
+                return MessageRef(platform_data=None)
+        elif isinstance(message, ThinkingMessage):
+            if not message.text.strip():
+                return MessageRef(platform_data=None)
+            return await self.send_thinking(message.text)
+        elif isinstance(message, ToolCallMessage):
+            if not message.calls:
+                return MessageRef(platform_data=None)
+        else:
             return MessageRef(platform_data=None)
 
         await self._apply_rate_limit()
 
-        # Convert markdown to Telegram HTML
-        html_text = markdown_to_html(text)
+        html_text = self._render_message(message)
         chunks = split_text(html_text, self.max_message_length)
 
         keyboard = self._build_keyboard(buttons)
@@ -171,7 +215,7 @@ class TelegramClient(PlatformClient):
     async def edit_message(
         self,
         ref: MessageRef,
-        text: str,
+        message: PlatformMessage,
         *,
         buttons: Optional[list[ButtonRow]] = None,
     ) -> None:
@@ -184,7 +228,7 @@ class TelegramClient(PlatformClient):
         if not msg:
             return
 
-        html_text = markdown_to_html(text)
+        html_text = self._render_message(message)
         keyboard = self._build_keyboard(buttons)
 
         try:
@@ -327,17 +371,7 @@ class TelegramClient(PlatformClient):
 
         await self._apply_rate_limit()
 
-        # Escape HTML entities in the raw text
-        from .formatter import escape_html
-        safe_text = escape_html(text)
-
-        # Truncate if needed
-        max_len = self.max_message_length - 20  # Room for emoji and tags
-        if len(safe_text) > max_len:
-            safe_text = safe_text[:max_len - 3] + "..."
-
-        # Construct HTML directly (no markdown processing)
-        html_text = f"🧠 <i>{safe_text}</i>"
+        html_text = self._format_thinking_html(text)
 
         try:
             msg = await self._bot.send_message(
@@ -372,7 +406,7 @@ class TelegramClient(PlatformClient):
 
 async def send_with_fallback(
     client: TelegramClient,
-    text: str,
+    message: PlatformMessage,
     existing_ref: Optional[MessageRef] = None,
     max_retries: int = 3,
 ) -> Optional[MessageRef]:
@@ -381,15 +415,13 @@ async def send_with_fallback(
     This is a helper for complex streaming scenarios where we need
     retry logic with exponential backoff.
     """
-    html_text = markdown_to_html(text)
-
     for attempt in range(max_retries):
         try:
             if existing_ref and existing_ref.platform_data:
-                await client.edit_message(existing_ref, text)
+                await client.edit_message(existing_ref, message)
                 return existing_ref
             else:
-                return await client.send_message(text)
+                return await client.send_message(message)
         except Exception as e:
             error_str = str(e).lower()
 
