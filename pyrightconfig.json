@@ -1,0 +1,6 @@
+{
+  "exclude": [
+    "platforms/telegram/runner.py",
+    "platforms/discord/runner.py"
+  ]
+}

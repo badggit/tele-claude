@@ -88,3 +88,6 @@ logs/
 
 # Claude skills (personal/private)
 .claude/skills/
+
+# Local utility scripts
+restart.sh

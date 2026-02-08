@@ -17,6 +17,7 @@ from typing import Optional, Protocol, runtime_checkable
 
 import discord
 
+from core.types import ReplyCapabilities
 from ..protocol import (
     ButtonRow,
     MessageRef,
@@ -71,6 +72,16 @@ class DiscordClient(PlatformClient):
     @property
     def max_message_length(self) -> int:
         return 2000  # Discord's limit
+
+    @property
+    def capabilities(self) -> ReplyCapabilities:
+        return ReplyCapabilities(
+            can_edit=True,
+            can_buttons=True,
+            can_typing=True,
+            max_length=self.max_message_length,
+            max_buttons_per_row=5,
+        )
 
     @property
     def channel(self) -> discord.TextChannel:

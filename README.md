@@ -53,6 +53,12 @@ python main.py telegram
 
 ## Usage
 
+### Run all platforms
+
+```bash
+python main.py run  # Starts Telegram + Discord (if tokens configured)
+```
+
 ### Telegram: Multi-project mode (default)
 
 ```bash
@@ -98,6 +104,24 @@ python main.py discord
 ```
 
 Channels are automatically matched to project folders in `~/Projects` by name (e.g. channel `my-app` matches folder `my_app` or `my-app`).
+
+### Session Management
+
+Query and inject prompts into running sessions via the Task API:
+
+```bash
+# List active sessions
+python main.py sessions list
+
+# Get session details
+python main.py sessions get "telegram:123:456"
+
+# Inject prompt into existing session
+python main.py sessions inject --key "telegram:123:456" "Run the tests"
+
+# Create new session with prompt
+python main.py sessions inject --platform telegram --chat-id 123 --thread-id 456 "Hello"
+```
 
 ## Browser Automation
 
