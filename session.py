@@ -360,12 +360,20 @@ async def interrupt_session(thread_id: int) -> bool:
     return True
 
 
-async def _format_plan_approval_message(platform: PlatformClient) -> str:
+async def _format_plan_approval_message(
+    platform: PlatformClient,
+    plan_dir: Path | None = None
+) -> str:
     """Read the most recent plan file and format it for approval.
 
     Looks in ~/.claude/plans/ for the most recently modified .md file.
+
+    Args:
+        platform: Platform client (used for max_message_length).
+        plan_dir: Optional directory to search for plans. Defaults to ~/.claude/plans/.
     """
-    plan_dir = Path.home() / ".claude" / "plans"
+    if plan_dir is None:
+        plan_dir = Path.home() / ".claude" / "plans"
     plan_content = None
     plan_file_name = None
 
