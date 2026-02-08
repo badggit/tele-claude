@@ -360,6 +360,47 @@ async def interrupt_session(thread_id: int) -> bool:
     return True
 
 
+async def _format_plan_approval_message(platform: PlatformClient) -> str:
+    """Read the most recent plan file and format it for approval.
+
+    Looks in ~/.claude/plans/ for the most recently modified .md file.
+    """
+    plan_dir = Path.home() / ".claude" / "plans"
+    plan_content = None
+    plan_file_name = None
+
+    if plan_dir.exists():
+        plan_files = sorted(
+            plan_dir.glob("*.md"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        if plan_files:
+            plan_file = plan_files[0]
+            plan_file_name = plan_file.name
+            try:
+                plan_content = plan_file.read_text()
+            except Exception:
+                pass
+
+    if plan_content:
+        # Truncate to fit platform limits (leave room for header/buttons)
+        max_len = platform.max_message_length - 200
+        if len(plan_content) > max_len:
+            plan_content = plan_content[:max_len] + "\n\n... (truncated)"
+
+        return (
+            f"📋 **Plan Approval**\n"
+            f"_{plan_file_name}_\n\n"
+            f"{plan_content}"
+        )
+    else:
+        return (
+            "📋 **Plan Approval**\n\n"
+            "_Could not find plan file in ~/.claude/plans/_"
+        )
+
+
 async def request_tool_permission(
     session: ClaudeSession,
     tool_name: str,
@@ -378,24 +419,28 @@ async def request_tool_permission(
     # Generate unique request ID
     request_id = str(uuid.uuid4())[:8]
 
-    # Format tool input for display
-    input_preview = []
-    for k, v in list(tool_input.items())[:3]:  # Show first 3 args
-        v_str = str(v)
-        if len(v_str) > 100:
-            v_str = v_str[:100] + "..."
-        input_preview.append(f"{k}: {v_str}")
-
-    if input_preview:
-        input_text = md_code_block("\n".join(input_preview))
+    # Special handling for ExitPlanMode - show the plan content
+    if tool_name == "ExitPlanMode":
+        message_text = await _format_plan_approval_message(platform)
     else:
-        input_text = "(no arguments)"
+        # Format tool input for display
+        input_preview = []
+        for k, v in list(tool_input.items())[:3]:  # Show first 3 args
+            v_str = str(v)
+            if len(v_str) > 100:
+                v_str = v_str[:100] + "..."
+            input_preview.append(f"{k}: {v_str}")
 
-    message_text = (
-        f"🔐 **Permission Request**\n\n"
-        f"Tool: {md_inline_code(tool_name)}\n"
-        f"Arguments:\n{input_text}"
-    )
+        if input_preview:
+            input_text = md_code_block("\n".join(input_preview))
+        else:
+            input_text = "(no arguments)"
+
+        message_text = (
+            f"🔐 **Permission Request**\n\n"
+            f"Tool: {md_inline_code(tool_name)}\n"
+            f"Arguments:\n{input_text}"
+        )
 
     # Build platform-agnostic keyboard
     buttons = [
@@ -424,19 +469,11 @@ async def request_tool_permission(
     if session.logger:
         session.logger.log_debug("permission", f"Waiting for user response", request_id=request_id, pending_keys=list(pending_permissions.keys()))
 
-    try:
-        # Wait for user response (timeout after 5 minutes)
-        allowed = await asyncio.wait_for(future, timeout=300.0)
-        if session.logger:
-            session.logger.log_debug("permission", f"Got user response: {allowed}", request_id=request_id)
-        return allowed
-    except asyncio.TimeoutError:
-        pending_permissions.pop(request_id, None)
-        if session.logger:
-            session.logger.log_debug("permission", "Request timed out", request_id=request_id)
-        if platform:
-            await platform.send_message(TextMessage("⏰ Permission request timed out (denied)"))
-        return False
+    # No timeout - this is async chat, user responds when they respond
+    allowed = await future
+    if session.logger:
+        session.logger.log_debug("permission", f"Got user response: {allowed}", request_id=request_id)
+    return allowed
 
 
 def create_permission_handler(session: ClaudeSession):
