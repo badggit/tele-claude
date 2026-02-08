@@ -1,52 +1,73 @@
 from __future__ import annotations
 
+import time
 from json import JSONDecodeError
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Optional
 
 from aiohttp import ContentTypeError, web
 
-import session
 from config import TASK_API_HOST, TASK_API_PORT
+from core.dispatcher import Dispatcher
+from core.types import Trigger, make_session_key
 
-CreateTaskChannel = Callable[[str], Awaitable[int]]
-
-_create_task_channel: Optional[CreateTaskChannel] = None
+_dispatcher: Optional[Dispatcher] = None
 _runner: Optional[web.AppRunner] = None
 _site: Optional[web.TCPSite] = None
 
 
-def register_task_channel_factory(factory: CreateTaskChannel) -> None:
-    """Called by platform runners to register their channel factory."""
-    global _create_task_channel
-    _create_task_channel = factory
+def register_dispatcher(dispatcher: Dispatcher) -> None:
+    global _dispatcher
+    _dispatcher = dispatcher
 
 
-def clear_task_channel_factory() -> None:
-    """Clear the registered task channel factory."""
-    global _create_task_channel
-    _create_task_channel = None
+def clear_dispatcher() -> None:
+    global _dispatcher
+    _dispatcher = None
 
 
-def _default_task_name(prompt: str) -> str:
-    return prompt[:50]
+def _get_dispatcher(request: Optional[web.Request] = None) -> Optional[Dispatcher]:
+    if request is not None:
+        dispatcher = request.app.get("dispatcher")
+        if dispatcher is not None:
+            return dispatcher
+    return _dispatcher
 
 
-def _session_has_running_task(active_session: session.ClaudeSession) -> bool:
-    current_task = active_session.current_task
-    return current_task is not None and not current_task.done()
+def _get_session_state(session) -> str:
+    if session.pending_permission:
+        return "awaiting_permission"
+    if session.current_task and not session.current_task.done():
+        return "processing"
+    return "idle"
 
 
-def _session_payload(active_session: session.ClaudeSession) -> dict[str, Any]:
+def _session_payload(session) -> dict[str, Any]:
+    thread_id = getattr(session.claude_session, "thread_id", None)
+    stats = session.stats
     return {
-        "thread_id": active_session.thread_id,
-        "cwd": active_session.cwd,
-        "active": active_session.active,
-        "has_running_task": _session_has_running_task(active_session),
+        "session_key": session.session_key,
+        "platform": session.platform,
+        "thread_id": thread_id,
+        "cwd": session.cwd,
+        "state": _get_session_state(session),
+        "stats": {
+            "created_at": stats.created_at,
+            "last_activity": stats.last_activity,
+            "uptime_seconds": max(0.0, time.time() - stats.created_at),
+            "message_count": stats.message_count,
+            "turn_count": stats.turn_count,
+            "interrupt_count": stats.interrupt_count,
+            "error_count": stats.error_count,
+        },
     }
 
 
 async def handle_inject(request: web.Request) -> web.Response:
     """POST /inject - inject a prompt into an existing or new session."""
+    dispatcher = _get_dispatcher(request)
+    if dispatcher is None:
+        return web.json_response({"error": "dispatcher_not_ready"}, status=503)
+
     try:
         payload = await request.json()
     except (JSONDecodeError, ContentTypeError):
@@ -60,73 +81,123 @@ async def handle_inject(request: web.Request) -> web.Response:
         return web.json_response({"error": "missing_prompt"}, status=400)
     prompt = prompt_value
 
-    thread_id_value = payload.get("thread_id")
-    if thread_id_value is not None:
-        if not isinstance(thread_id_value, int) or isinstance(thread_id_value, bool):
-            return web.json_response({"error": "invalid_thread_id"}, status=400)
-        thread_id = thread_id_value
-        active_session = session.sessions.get(thread_id)
-        if not active_session:
+    session_key_value = payload.get("session_key")
+    if session_key_value is not None:
+        if not isinstance(session_key_value, str):
+            return web.json_response({"error": "invalid_session_key"}, status=400)
+        session = dispatcher.sessions.get(session_key_value)
+        if not session:
             return web.json_response({"error": "session_not_found"}, status=404)
-        session.start_claude_task(thread_id, prompt)
-        return web.json_response(
-            {"status": "injected", "thread_id": thread_id, "cwd": active_session.cwd}
+        trigger = Trigger(
+            platform=session.platform,
+            session_key=session_key_value,
+            prompt=prompt,
+            reply_context={},
+            source="task_api",
         )
+        await dispatcher.route_trigger(trigger)
+        return web.json_response({"status": "injected", "session_key": session_key_value})
 
-    if _create_task_channel is None:
-        return web.json_response({"error": "no_task_channel_factory"}, status=503)
+    platform = payload.get("platform")
+    if platform not in ("telegram", "discord"):
+        return web.json_response({"error": "platform_required"}, status=400)
 
-    task_name_value = payload.get("task_name")
-    task_name: Optional[str] = None
-    if task_name_value is not None:
-        if not isinstance(task_name_value, str):
-            return web.json_response({"error": "invalid_task_name"}, status=400)
-        if task_name_value.strip():
-            task_name = task_name_value
+    if platform == "telegram":
+        chat_id = payload.get("chat_id")
+        if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+            return web.json_response({"error": "chat_id_required"}, status=400)
 
-    task_name = task_name or _default_task_name(prompt)
-    thread_id = await _create_task_channel(task_name)
-    session.start_claude_task(thread_id, prompt)
-    active_session = session.sessions.get(thread_id)
-    cwd = active_session.cwd if active_session else ""
-    return web.json_response(
-        {"status": "injected", "thread_id": thread_id, "cwd": cwd}
+        thread_id = payload.get("thread_id")
+        if thread_id is not None and (not isinstance(thread_id, int) or isinstance(thread_id, bool)):
+            return web.json_response({"error": "invalid_thread_id"}, status=400)
+
+        if thread_id is None:
+            listener = dispatcher.get_listener("telegram")
+            if not listener or not hasattr(listener, "create_topic"):
+                return web.json_response({"error": "telegram_listener_unavailable"}, status=503)
+            topic_name = payload.get("topic_name")
+            if not isinstance(topic_name, str) or not topic_name.strip():
+                topic_name = "Task"
+            thread_id = await listener.create_topic(chat_id, topic_name)  # type: ignore[call-arg]
+
+        session_key = make_session_key("telegram", chat_id=chat_id, thread_id=thread_id)
+        reply_context = {"chat_id": chat_id, "thread_id": thread_id}
+
+    else:
+        channel_id = payload.get("channel_id")
+        if not isinstance(channel_id, int) or isinstance(channel_id, bool):
+            return web.json_response({"error": "channel_id_required"}, status=400)
+        session_key = make_session_key("discord", channel_id=channel_id)
+        reply_context = {"channel_id": channel_id}
+
+    trigger = Trigger(
+        platform=platform,
+        session_key=session_key,
+        prompt=prompt,
+        reply_context=reply_context,
+        source="task_api",
     )
+    await dispatcher.route_trigger(trigger)
+    return web.json_response({"status": "injected", "session_key": session_key})
 
 
 async def handle_sessions(request: web.Request) -> web.Response:
     """GET /sessions - list active sessions."""
-    active_sessions = [_session_payload(item) for item in session.sessions.values()]
-    return web.json_response(active_sessions)
+    dispatcher = _get_dispatcher(request)
+    if dispatcher is None:
+        return web.json_response([], status=200)
+    return web.json_response([_session_payload(item) for item in dispatcher.sessions.values()])
+
+
+async def handle_session_detail(request: web.Request) -> web.Response:
+    """GET /sessions/{key} - get single session details."""
+    dispatcher = _get_dispatcher(request)
+    if dispatcher is None:
+        return web.json_response({"error": "dispatcher_not_ready"}, status=503)
+    key = request.match_info.get("key")
+    if not key:
+        return web.json_response({"error": "missing_key"}, status=400)
+    session = dispatcher.sessions.get(key)
+    if not session:
+        return web.json_response({"error": "not_found"}, status=404)
+    return web.json_response(_session_payload(session))
 
 
 async def handle_health(request: web.Request) -> web.Response:
     """GET /health - basic health check."""
+    dispatcher = _get_dispatcher(request)
     return web.json_response(
         {
             "status": "ok",
-            "sessions": len(session.sessions),
-            "factory_registered": _create_task_channel is not None,
+            "sessions": len(dispatcher.sessions) if dispatcher else 0,
+            "dispatcher_ready": dispatcher is not None,
         }
     )
 
 
-def create_app() -> web.Application:
+def create_app(dispatcher: Optional[Dispatcher] = None) -> web.Application:
     """Create the aiohttp application for the task API."""
     app = web.Application()
+    app["dispatcher"] = dispatcher
     app.router.add_post("/inject", handle_inject)
     app.router.add_get("/sessions", handle_sessions)
+    app.router.add_get("/sessions/{key}", handle_session_detail)
     app.router.add_get("/health", handle_health)
     return app
 
 
-async def start_task_api(host: str = TASK_API_HOST, port: int = TASK_API_PORT) -> web.AppRunner:
-    """Start the HTTP server. Called from platform runners."""
+async def start_task_api(
+    dispatcher: Dispatcher,
+    host: str = TASK_API_HOST,
+    port: int = TASK_API_PORT,
+) -> web.AppRunner:
+    """Start the HTTP server. Called from dispatcher/main."""
     global _runner, _site
     if _runner is not None:
         return _runner
 
-    app = create_app()
+    register_dispatcher(dispatcher)
+    app = create_app(dispatcher)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
