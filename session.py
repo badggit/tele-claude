@@ -950,25 +950,28 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         telegram_mcp = create_telegram_mcp_server(session)
 
         # Configure options - use permission handler for interactive tool approval
-        options = ClaudeAgentOptions(
-            model=session.model_override or config.CLAUDE_MODEL,
-            allowed_tools=[],  # Empty - let can_use_tool handle all permissions
-            can_use_tool=create_permission_handler(session),
-            permission_mode="acceptEdits",
-            cwd=session.cwd,
-            resume=session.session_id,  # Resume previous conversation if exists
-            system_prompt=system_prompt,
-            setting_sources=["project"] if session.sandboxed else ["user", "project"],  # Sandboxed: project only
-            max_thinking_tokens=10000,  # Enable interleaved thinking between tool calls
-            mcp_servers={
+        model_name = session.model_override or config.CLAUDE_MODEL
+        options_kwargs = {
+            "allowed_tools": [],  # Empty - let can_use_tool handle all permissions
+            "can_use_tool": create_permission_handler(session),
+            "permission_mode": "acceptEdits",
+            "cwd": session.cwd,
+            "resume": session.session_id,  # Resume previous conversation if exists
+            "system_prompt": system_prompt,
+            "setting_sources": ["project"] if session.sandboxed else ["user", "project"],  # Sandboxed: project only
+            "max_thinking_tokens": 10000,  # Enable interleaved thinking between tool calls
+            "mcp_servers": {
                 "telegram-tools": telegram_mcp,
             },
-            hooks={
+            "hooks": {
                 "PreCompact": [
                     HookMatcher(hooks=[create_pre_compact_hook(session)])
                 ]
-            }
-        )
+            },
+        }
+        if model_name:
+            options_kwargs["model"] = model_name
+        options = ClaudeAgentOptions(**options_kwargs)
 
         # Query Claude using ClaudeSDKClient (required for can_use_tool support)
         # can_use_tool requires streaming mode - wrap prompt in async generator
