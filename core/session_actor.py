@@ -89,6 +89,9 @@ class SessionActor:
             contextual = getattr(self.claude_session, "contextual_commands", [])
             command_prompt = get_command_prompt(command_name, contextual)
             if command_prompt is not None:
+                if command_prompt == "":
+                    # Command handled by platform (e.g. /help, /model) - skip
+                    return
                 prompt = command_prompt
 
         self.stats.message_count += 1

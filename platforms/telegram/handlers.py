@@ -17,7 +17,7 @@ import logging
 # Use standard logging - logger.py's setup_logging() will configure the handlers
 logger = logging.getLogger("tele-claude.handlers")
 
-from config import GENERAL_TOPIC_ID, ALLOWED_CHATS
+from config import GENERAL_TOPIC_ID, ALLOWED_CHATS, AVAILABLE_MODELS, CLAUDE_MODEL
 from dispatcher import dispatcher, DispatchItem
 from utils import get_project_folders, ensure_image_within_limits
 from session import sessions, start_session, start_session_ambient, start_claude_task, resolve_permission, interrupt_session
@@ -256,6 +256,46 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Unknown callback - ignore
 
 
+async def _handle_model_command(
+    text: str, session, bot, chat_id: int, thread_id: int | None
+) -> None:
+    """Handle /model command logic - shared by CommandHandler and inline handler."""
+    args = text.split(maxsplit=1)
+    if len(args) < 2:
+        current = session.model_override or CLAUDE_MODEL or "default"
+        models_list = "\n".join(f"  <code>{m}</code>" for m in AVAILABLE_MODELS)
+        await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=(
+                f"<b>Current model:</b> <code>{current}</code>\n\n"
+                f"<b>Available:</b>\n{models_list}\n\n"
+                "Usage: /model &lt;name&gt;"
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    model_name = args[1].strip()
+    if model_name not in AVAILABLE_MODELS:
+        models_list = "\n".join(f"  <code>{m}</code>" for m in AVAILABLE_MODELS)
+        await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=f"Unknown model: <code>{model_name}</code>\n\n<b>Available:</b>\n{models_list}",
+            parse_mode="HTML",
+        )
+        return
+
+    session.model_override = model_name
+    await bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        text=f"Model switched to <code>{model_name}</code> for this session.",
+        parse_mode="HTML",
+    )
+
+
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command - show all available commands."""
     message = update.message
@@ -270,17 +310,45 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     thread_id = message.message_thread_id
     chat_id = message.chat_id
 
-    # Get contextual commands if in an active session
+    # Get contextual commands and current model if in an active session
     contextual_commands: list = []
+    current_model: str | None = None
     if thread_id and thread_id in sessions:
-        contextual_commands = sessions[thread_id].contextual_commands
+        session = sessions[thread_id]
+        contextual_commands = session.contextual_commands
+        current_model = session.model_override or CLAUDE_MODEL
 
-    help_text = get_help_message(contextual_commands)
+    help_text = get_help_message(contextual_commands, current_model)
     await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=thread_id,
         text=help_text,
         parse_mode="HTML"
+    )
+
+
+async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /model command (via CommandHandler) - delegates to shared helper."""
+    message = update.message
+    if message is None:
+        return
+
+    if not is_authorized_chat(message.chat_id):
+        return
+
+    thread_id = message.message_thread_id
+    chat_id = message.chat_id
+
+    if not thread_id or thread_id not in sessions:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text="No active session. Start a session first.",
+        )
+        return
+
+    await _handle_model_command(
+        message.text or "", sessions[thread_id], context.bot, chat_id, thread_id
     )
 
 
@@ -412,6 +480,24 @@ async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYP
             # Extract command name (handle /cmd or /cmd@botname)
             command_part = text.split()[0]
             command_name = command_part.lstrip("/").split("@")[0]
+
+            # Commands handled locally (not forwarded to Claude)
+            if command_name == "help":
+                help_text = get_help_message(
+                    session.contextual_commands,
+                    session.model_override or CLAUDE_MODEL,
+                )
+                await context.bot.send_message(
+                    chat_id=message.chat_id,
+                    message_thread_id=thread_id,
+                    text=help_text,
+                    parse_mode="HTML",
+                )
+                return
+
+            if command_name == "model":
+                await _handle_model_command(text, session, context.bot, message.chat_id, thread_id)
+                return
 
             # Look up the command
             cmd_prompt = get_command_prompt(command_name, session.contextual_commands)

@@ -28,6 +28,7 @@ from claude_agent_sdk.types import (
     TextBlock, ToolUseBlock, ThinkingBlock, ToolResultBlock
 )
 
+import config
 from config import PROJECTS_DIR
 from logger import SessionLogger
 from diff_image import edit_to_image
@@ -238,6 +239,7 @@ class ClaudeSession:
     pending_image_path: Optional[str] = None  # Buffered image waiting for prompt
     contextual_commands: list = field(default_factory=list)  # Project-specific slash commands
     sandboxed: bool = False  # If True, only load project settings (no ~/.claude/)
+    model_override: Optional[str] = None  # Per-session model override (via /model command)
 
     def get_platform(self) -> Optional[PlatformClient]:
         """Get platform client, creating from bot if needed (backwards compat)."""
@@ -949,6 +951,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
 
         # Configure options - use permission handler for interactive tool approval
         options = ClaudeAgentOptions(
+            model=session.model_override or config.CLAUDE_MODEL,
             allowed_tools=[],  # Empty - let can_use_tool handle all permissions
             can_use_tool=create_permission_handler(session),
             permission_mode="acceptEdits",

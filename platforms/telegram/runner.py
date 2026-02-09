@@ -24,7 +24,7 @@ def run_global() -> None:
     from config import BOT_TOKEN
     from platforms.telegram.handlers import (
         handle_new_topic, handle_callback, handle_message,
-        handle_topic_created, handle_photo, handle_help
+        handle_topic_created, handle_photo, handle_help, handle_model
     )
 
     setup_logging()
@@ -73,6 +73,13 @@ def run_global() -> None:
         filters=filters.ChatType.SUPERGROUP
     ))
 
+    # Handle /model command
+    app.add_handler(CommandHandler(
+        "model",
+        handle_model,
+        filters=filters.ChatType.SUPERGROUP
+    ))
+
     # Handle inline keyboard button clicks
     app.add_handler(CallbackQueryHandler(handle_callback))
 
@@ -102,7 +109,7 @@ def run_local(local_cwd: Path) -> None:
     """
     from platforms.telegram.handlers import (
         handle_callback, handle_message, handle_photo,
-        handle_help, is_authorized_chat
+        handle_help, handle_model, is_authorized_chat
     )
     from session import start_session_local
 
@@ -186,6 +193,13 @@ def run_local(local_cwd: Path) -> None:
     app.add_handler(CommandHandler(
         "help",
         handle_help,
+        filters=filters.ChatType.SUPERGROUP
+    ))
+
+    # Handle /model command
+    app.add_handler(CommandHandler(
+        "model",
+        handle_model,
         filters=filters.ChatType.SUPERGROUP
     ))
 

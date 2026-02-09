@@ -39,6 +39,15 @@ DISCORD_ALLOWED_GUILDS: set[int] = {
 }
 
 
+# --- Model Config ---
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL") or None  # e.g. "claude-opus-4-6"
+AVAILABLE_MODELS = [
+    "claude-opus-4-6",
+    "claude-opus-4-5-20251101",
+    "claude-sonnet-4-5-20251101",
+    "claude-sonnet-4-20250514",
+]
+
 # --- Task Injection API ---
 TASK_API_HOST = os.getenv("TASK_API_HOST", "127.0.0.1")
 TASK_API_PORT = _env_int("TASK_API_PORT", 9111)

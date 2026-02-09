@@ -13,7 +13,7 @@ from typing import Optional
 import discord
 
 from dispatcher import dispatcher, DispatchItem
-from config import DISCORD_ALLOWED_GUILDS, PROJECTS_DIR
+from config import DISCORD_ALLOWED_GUILDS, PROJECTS_DIR, AVAILABLE_MODELS, CLAUDE_MODEL
 from session import sessions, start_session_discord, start_session_ambient_discord, start_claude_task, resolve_permission, interrupt_session, stop_session
 from utils import ensure_image_within_limits
 from commands import get_command_prompt, get_help_message
@@ -118,6 +118,11 @@ async def _handle_message_impl(message: discord.Message, bot: discord.Client) ->
                 # Handle built-in /help command
                 if command_name == "help":
                     await handle_help(message)
+                    return
+
+                # Handle /model command
+                if command_name == "model":
+                    await handle_model(message)
                     return
 
                 # Handle /close command - stop session and archive thread
@@ -380,11 +385,42 @@ async def handle_help(message: discord.Message) -> None:
     session_id = channel.id
 
     contextual_commands: list = []
+    current_model: str | None = None
     if session_id in sessions:
-        contextual_commands = sessions[session_id].contextual_commands
+        session = sessions[session_id]
+        contextual_commands = session.contextual_commands
+        current_model = session.model_override or CLAUDE_MODEL
 
-    help_text = get_help_message(contextual_commands)
+    help_text = get_help_message(contextual_commands, current_model)
     await channel.send(help_text)
+
+
+async def handle_model(message: discord.Message) -> None:
+    """Handle /model command - switch model for the current session."""
+    channel = message.channel
+    session_id = channel.id
+
+    if session_id not in sessions:
+        await channel.send("No active session. Start a session first.")
+        return
+
+    session = sessions[session_id]
+    args = message.content.split(maxsplit=1)
+
+    if len(args) < 2:
+        current = session.model_override or CLAUDE_MODEL or "default"
+        models_list = "\n".join(f"  `{m}`" for m in AVAILABLE_MODELS)
+        await channel.send(f"**Current model:** `{current}`\n\n**Available:**\n{models_list}\n\nUsage: /model <name>")
+        return
+
+    model_name = args[1].strip()
+    if model_name not in AVAILABLE_MODELS:
+        models_list = "\n".join(f"  `{m}`" for m in AVAILABLE_MODELS)
+        await channel.send(f"Unknown model: `{model_name}`\n\n**Available:**\n{models_list}")
+        return
+
+    session.model_override = model_name
+    await channel.send(f"Model switched to `{model_name}` for this session.")
 
 
 async def handle_close(message: discord.Message) -> None:

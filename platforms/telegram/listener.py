@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable, Optional
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from config import GENERAL_TOPIC_ID, PROJECTS_DIR
+from config import GENERAL_TOPIC_ID, PROJECTS_DIR, AVAILABLE_MODELS, CLAUDE_MODEL
 from core.types import Trigger, make_session_key
 from core.dispatcher import TransportListener
 from utils import ensure_image_within_limits, get_project_folders
@@ -57,6 +57,11 @@ class TelegramListener(TransportListener):
         self._app.add_handler(CommandHandler(
             "help",
             self._handle_help,
+            filters=filters.ChatType.SUPERGROUP,
+        ))
+        self._app.add_handler(CommandHandler(
+            "model",
+            self._handle_model,
             filters=filters.ChatType.SUPERGROUP,
         ))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -149,11 +154,71 @@ class TelegramListener(TransportListener):
         thread_id = message.message_thread_id or GENERAL_TOPIC_ID
         session = session_module.sessions.get(thread_id)
         contextual = session.contextual_commands if session else []
-        help_text = get_help_message(contextual)
+        current_model = (session.model_override if session else None) or CLAUDE_MODEL
+        help_text = get_help_message(contextual, current_model)
         await context.bot.send_message(
             chat_id=message.chat_id,
             message_thread_id=message.message_thread_id,
             text=help_text,
+            parse_mode="HTML",
+        )
+
+    async def _handle_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.message
+        if message is None:
+            return
+        if not self._is_authorized_chat(message.chat_id):
+            return
+
+        import session as session_module
+
+        thread_id = message.message_thread_id or GENERAL_TOPIC_ID
+        session = session_module.sessions.get(thread_id)
+        chat_id = message.chat_id
+        msg_thread_id = message.message_thread_id
+
+        if not session:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=msg_thread_id,
+                text="No active session. Start a session first.",
+            )
+            return
+
+        text = message.text or ""
+        args = text.split(maxsplit=1)
+
+        if len(args) < 2:
+            current = session.model_override or CLAUDE_MODEL or "default"
+            models_list = "\n".join(f"  <code>{m}</code>" for m in AVAILABLE_MODELS)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=msg_thread_id,
+                text=(
+                    f"<b>Current model:</b> <code>{current}</code>\n\n"
+                    f"<b>Available:</b>\n{models_list}\n\n"
+                    "Usage: /model &lt;name&gt;"
+                ),
+                parse_mode="HTML",
+            )
+            return
+
+        model_name = args[1].strip()
+        if model_name not in AVAILABLE_MODELS:
+            models_list = "\n".join(f"  <code>{m}</code>" for m in AVAILABLE_MODELS)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=msg_thread_id,
+                text=f"Unknown model: <code>{model_name}</code>\n\n<b>Available:</b>\n{models_list}",
+                parse_mode="HTML",
+            )
+            return
+
+        session.model_override = model_name
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=msg_thread_id,
+            text=f"Model switched to <code>{model_name}</code> for this session.",
             parse_mode="HTML",
         )
 

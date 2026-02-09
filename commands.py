@@ -45,6 +45,12 @@ HARDCODED_COMMANDS: list[SlashCommand] = [
         prompt="/compact",
         is_contextual=False,
     ),
+    SlashCommand(
+        name="model",
+        description="Switch model for this session",
+        prompt="",  # Handled specially - doesn't go to Claude
+        is_contextual=False,
+    ),
 ]
 
 
@@ -166,26 +172,38 @@ def get_command_prompt(
     return None
 
 
-def get_help_message(contextual_commands: list[SlashCommand]) -> str:
+def get_help_message(contextual_commands: list[SlashCommand], current_model: Optional[str] = None) -> str:
     """Generate help message listing all available commands.
 
     Args:
         contextual_commands: Project-specific commands for current session
+        current_model: Currently active model name for this session
 
     Returns:
         Formatted help message string (HTML)
     """
+    from config import AVAILABLE_MODELS
+
     lines = ["<b>Available Commands</b>\n"]
 
     # Global commands section
     lines.append("<b>Global:</b>")
     for cmd in HARDCODED_COMMANDS:
-        lines.append(f"  /{cmd.name} - {cmd.description}")
+        if cmd.name == "model":
+            lines.append(f"  /{cmd.name} &lt;name&gt; - {cmd.description}")
+        else:
+            lines.append(f"  /{cmd.name} - {cmd.description}")
 
     # Contextual commands section (if any)
     if contextual_commands:
         lines.append("\n<b>Project:</b>")
         for cmd in contextual_commands:
             lines.append(f"  /{cmd.name} - {cmd.description}")
+
+    # Model info
+    lines.append(f"\n<b>Current model:</b> {current_model or 'default'}")
+    lines.append("<b>Available models:</b>")
+    for m in AVAILABLE_MODELS:
+        lines.append(f"  <code>{m}</code>")
 
     return "\n".join(lines)
