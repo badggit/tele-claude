@@ -160,19 +160,33 @@ async def _handle_message_impl(message: discord.Message, bot: discord.Client) ->
             return
 
         # No session in this thread - check if parent channel is a project channel or #general
+        command_name = None
+        if text.startswith("/"):
+            command_name = text.split()[0].lstrip("/")
+
         project_path = resolve_project_for_channel(parent_channel_name) if parent_channel_name else None
         if project_path:
             # Start new session in this thread
             success = await start_session_discord(thread_id, project_path, channel)
             if success:
-                start_claude_task(thread_id, text, None)
+                if command_name == "model":
+                    session = sessions.get(thread_id)
+                    if session:
+                        await _handle_model_command(text, session, channel)
+                else:
+                    start_claude_task(thread_id, text, None)
             else:
                 await channel.send(f"Failed to start session: project not found")
         elif _is_general_channel(channel):
             # Start ambient session for #general thread
             success = await start_session_ambient_discord(thread_id, channel)
             if success:
-                start_claude_task(thread_id, text, None)
+                if command_name == "model":
+                    session = sessions.get(thread_id)
+                    if session:
+                        await _handle_model_command(text, session, channel)
+                else:
+                    start_claude_task(thread_id, text, None)
             else:
                 await channel.send(f"Failed to start ambient session")
         return
@@ -395,22 +409,19 @@ async def handle_help(message: discord.Message) -> None:
     await channel.send(help_text)
 
 
-async def handle_model(message: discord.Message) -> None:
-    """Handle /model command - switch model for the current session."""
-    channel = message.channel
-    session_id = channel.id
-
-    if session_id not in sessions:
-        await channel.send("No active session. Start a session first.")
-        return
-
-    session = sessions[session_id]
-    args = message.content.split(maxsplit=1)
-
+async def _handle_model_command(
+    text: str,
+    session,
+    channel: discord.abc.Messageable,
+) -> None:
+    """Handle /model command logic for a specific session."""
+    args = text.split(maxsplit=1)
     if len(args) < 2:
         current = session.model_override or CLAUDE_MODEL or "default"
         models_list = "\n".join(f"  `{m}`" for m in AVAILABLE_MODELS)
-        await channel.send(f"**Current model:** `{current}`\n\n**Available:**\n{models_list}\n\nUsage: /model <name>")
+        await channel.send(
+            f"**Current model:** `{current}`\n\n**Available:**\n{models_list}\n\nUsage: /model <name>"
+        )
         return
 
     model_name = args[1].strip()
@@ -421,6 +432,19 @@ async def handle_model(message: discord.Message) -> None:
 
     session.model_override = model_name
     await channel.send(f"Model switched to `{model_name}` for this session.")
+
+
+async def handle_model(message: discord.Message) -> None:
+    """Handle /model command - switch model for the current session."""
+    channel = message.channel
+    session_id = channel.id
+
+    if session_id not in sessions:
+        await channel.send("No active session. Start a session first.")
+        return
+
+    session = sessions[session_id]
+    await _handle_model_command(message.content, session, channel)
 
 
 async def handle_close(message: discord.Message) -> None:
