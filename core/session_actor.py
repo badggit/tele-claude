@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Any
 
 from core.types import ReplyTarget, SessionStats, Trigger
+from platforms.protocol import TextMessage
 
 _log = logging.getLogger("tele-claude.session_actor")
 
@@ -90,7 +91,10 @@ class SessionActor:
             command_prompt = get_command_prompt(command_name, contextual)
             if command_prompt is not None:
                 if command_prompt == "":
-                    # Command handled by platform (e.g. /help, /model) - skip
+                    # Allow actor-side fallback for platform-owned commands when
+                    # listener path does not implement them (e.g. Discord /model).
+                    if await self._handle_platform_command(command_name, prompt):
+                        return
                     return
                 prompt = command_prompt
 
@@ -114,6 +118,47 @@ class SessionActor:
         except Exception:
             self.stats.error_count += 1
             _log.exception("Failed to start Claude task session_key=%s", self.session_key)
+
+    async def _handle_platform_command(self, command_name: str, prompt: str) -> bool:
+        """Handle platform-owned commands that need actor-side fallback."""
+        if command_name == "model":
+            await self._handle_model_command(prompt)
+            return True
+        return False
+
+    async def _handle_model_command(self, prompt: str) -> None:
+        """Handle /model command for sessions routed through SessionActor."""
+        from config import AVAILABLE_MODELS, CLAUDE_MODEL
+
+        args = prompt.split(maxsplit=1)
+        current_model = getattr(self.claude_session, "model_override", None) or CLAUDE_MODEL or "default"
+
+        if len(args) < 2:
+            models = "\n".join(f"  `{name}`" for name in AVAILABLE_MODELS)
+            await self.reply_target.send(
+                TextMessage(
+                    f"Current model: `{current_model}`\n\n"
+                    f"Available models:\n{models}\n\n"
+                    "Usage: /model <name>"
+                )
+            )
+            return
+
+        model_name = args[1].strip()
+        if model_name not in AVAILABLE_MODELS:
+            models = "\n".join(f"  `{name}`" for name in AVAILABLE_MODELS)
+            await self.reply_target.send(
+                TextMessage(
+                    f"Unknown model: `{model_name}`\n\n"
+                    f"Available models:\n{models}"
+                )
+            )
+            return
+
+        setattr(self.claude_session, "model_override", model_name)
+        await self.reply_target.send(
+            TextMessage(f"Model switched to `{model_name}` for this session.")
+        )
 
     async def _cancel_current_task(self) -> None:
         """Cancel current task and wait for cleanup."""

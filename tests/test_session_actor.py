@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -131,3 +131,44 @@ async def test_cancel_current_task_cancels_pending_permission(monkeypatch: pytes
     assert pending.cancelled() is True
     assert actor.pending_permission is None
     assert actor.current_task is None
+
+
+@pytest.mark.asyncio
+async def test_model_command_sets_override_and_skips_claude_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    import session as session_module
+    import config
+
+    started = False
+
+    def fake_start(thread_id: int, prompt: str, bot) -> asyncio.Task:
+        nonlocal started
+        started = True
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(session_module, "start_claude_task", fake_start)
+
+    reply_target = MagicMock()
+    reply_target.send = AsyncMock(return_value=MagicMock())
+
+    actor = SessionActor(
+        session_key="discord:42",
+        platform="discord",
+        cwd="/tmp",
+        reply_target=reply_target,
+        claude_session=MagicMock(
+            thread_id=42,
+            bot=None,
+            pending_image_path=None,
+            contextual_commands=[],
+            model_override=None,
+        ),
+    )
+
+    model_name = config.AVAILABLE_MODELS[0]
+    await actor._handle_prompt(f"/model {model_name}", images=[], gen_id=1)
+
+    assert getattr(actor.claude_session, "model_override") == model_name
+    assert started is False
+    reply_target.send.assert_awaited_once()
+    sent_message = reply_target.send.await_args.args[0]
+    assert f"Model switched to `{model_name}`" in sent_message.text
