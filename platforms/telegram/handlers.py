@@ -482,22 +482,8 @@ async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYP
             command_part = text.split()[0]
             command_name = command_part.lstrip("/").split("@")[0]
 
-            # Commands handled locally (not forwarded to Claude)
-            if command_name == "help":
-                help_text = get_help_message(
-                    session.contextual_commands,
-                    session.model_override or CLAUDE_MODEL,
-                )
-                await context.bot.send_message(
-                    chat_id=message.chat_id,
-                    message_thread_id=thread_id,
-                    text=help_text,
-                    parse_mode="HTML",
-                )
-                return
-
-            if command_name == "model":
-                await _handle_model_command(text, session, context.bot, message.chat_id, thread_id)
+            # Commands handled by CommandHandlers (avoid duplicate replies).
+            if command_name in {"help", "model"}:
                 return
 
             # Look up the command
