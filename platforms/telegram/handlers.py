@@ -338,8 +338,9 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     thread_id = message.message_thread_id
     chat_id = message.chat_id
+    effective_thread_id = thread_id if thread_id else GENERAL_TOPIC_ID
 
-    if not thread_id or thread_id not in sessions:
+    if effective_thread_id not in sessions:
         await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=thread_id,
@@ -348,7 +349,7 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await _handle_model_command(
-        message.text or "", sessions[thread_id], context.bot, chat_id, thread_id
+        message.text or "", sessions[effective_thread_id], context.bot, chat_id, thread_id
     )
 
 
