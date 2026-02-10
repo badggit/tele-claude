@@ -28,7 +28,7 @@ from claude_agent_sdk.types import (
     TextBlock, ToolUseBlock, ThinkingBlock, ToolResultBlock
 )
 
-from config import PROJECTS_DIR
+from config import PROJECTS_DIR, CLAUDE_MODEL
 from logger import SessionLogger
 from diff_image import edit_to_image
 from commands import load_contextual_commands, register_commands_for_chat
@@ -977,7 +977,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         # Configure options - use permission handler for interactive tool approval
         def build_options(resume_session_id: Optional[str]) -> ClaudeAgentOptions:
             return ClaudeAgentOptions(
-                model=None,  # Use SDK default
+                model=CLAUDE_MODEL,  # From config/env, None = SDK default
                 allowed_tools=[],  # Empty - let can_use_tool handle all permissions
                 can_use_tool=create_permission_handler(session),
                 permission_mode="acceptEdits",
