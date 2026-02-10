@@ -36,6 +36,18 @@ class Trigger:
 
 
 @dataclass
+class PersistedSession:
+    """Session metadata for persistence."""
+
+    claude_session_id: str
+    cwd: str
+    platform: str
+    created_at: float
+    last_activity: float
+    message_count: int = 0
+
+
+@dataclass
 class SessionStats:
     """Runtime statistics for a session."""
 
