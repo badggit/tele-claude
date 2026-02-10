@@ -13,6 +13,13 @@ from core.types import Trigger, make_session_key
 _dispatcher: Optional[Dispatcher] = None
 _runner: Optional[web.AppRunner] = None
 _site: Optional[web.TCPSite] = None
+_discord_task_factory: Any = None
+
+
+def register_task_channel_factory(factory: Any) -> None:
+    """Register Discord task channel factory (called by Discord runner)."""
+    global _discord_task_factory
+    _discord_task_factory = factory
 
 
 def register_dispatcher(dispatcher: Dispatcher) -> None:
@@ -124,11 +131,15 @@ async def handle_inject(request: web.Request) -> web.Response:
         reply_context = {"chat_id": chat_id, "thread_id": thread_id}
 
     else:
-        channel_id = payload.get("channel_id")
-        if not isinstance(channel_id, int) or isinstance(channel_id, bool):
-            return web.json_response({"error": "channel_id_required"}, status=400)
-        session_key = make_session_key("discord", channel_id=channel_id)
-        reply_context = {"channel_id": channel_id}
+        # Discord: use factory to create thread in #tasks channel
+        if _discord_task_factory is None:
+            return web.json_response({"error": "discord_factory_unavailable"}, status=503)
+        topic_name = payload.get("topic_name")
+        if not isinstance(topic_name, str) or not topic_name.strip():
+            topic_name = "Task"
+        thread_id = await _discord_task_factory(topic_name)
+        session_key = make_session_key("discord", channel_id=thread_id)
+        reply_context = {"channel_id": thread_id}
 
     trigger = Trigger(
         platform=platform,
