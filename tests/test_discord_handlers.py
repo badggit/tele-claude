@@ -10,7 +10,7 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from platforms.discord.handlers import _normalize_name, resolve_project_for_channel
+from platforms.discord.listener import _normalize_name, resolve_project_for_channel
 
 
 class TestNormalizeName:
@@ -41,55 +41,55 @@ class TestResolveProjectForChannel:
     def test_exact_match(self, tmp_path: Path):
         """Channel name exactly matches folder name."""
         (tmp_path / "my-project").mkdir()
-        with patch("platforms.discord.handlers.PROJECTS_DIR", tmp_path):
+        with patch("platforms.discord.listener.PROJECTS_DIR", tmp_path):
             result = resolve_project_for_channel("my-project")
             assert result == str(tmp_path / "my-project")
 
     def test_underscore_folder_matches_dash_channel(self, tmp_path: Path):
         """Folder with underscores matches channel with dashes."""
         (tmp_path / "my_project").mkdir()
-        with patch("platforms.discord.handlers.PROJECTS_DIR", tmp_path):
+        with patch("platforms.discord.listener.PROJECTS_DIR", tmp_path):
             result = resolve_project_for_channel("my-project")
             assert result == str(tmp_path / "my_project")
 
     def test_case_insensitive(self, tmp_path: Path):
         """Matching is case-insensitive."""
         (tmp_path / "MyProject").mkdir()
-        with patch("platforms.discord.handlers.PROJECTS_DIR", tmp_path):
+        with patch("platforms.discord.listener.PROJECTS_DIR", tmp_path):
             result = resolve_project_for_channel("myproject")
             assert result == str(tmp_path / "MyProject")
 
     def test_no_match_returns_none(self, tmp_path: Path):
         """Returns None when no matching folder exists."""
         (tmp_path / "other-project").mkdir()
-        with patch("platforms.discord.handlers.PROJECTS_DIR", tmp_path):
+        with patch("platforms.discord.listener.PROJECTS_DIR", tmp_path):
             result = resolve_project_for_channel("my-project")
             assert result is None
 
     def test_hidden_folders_ignored(self, tmp_path: Path):
         """Folders starting with . are ignored."""
         (tmp_path / ".my-project").mkdir()
-        with patch("platforms.discord.handlers.PROJECTS_DIR", tmp_path):
+        with patch("platforms.discord.listener.PROJECTS_DIR", tmp_path):
             result = resolve_project_for_channel("my-project")
             assert result is None
 
     def test_files_ignored(self, tmp_path: Path):
         """Files are ignored, only directories match."""
         (tmp_path / "my-project").touch()  # file, not directory
-        with patch("platforms.discord.handlers.PROJECTS_DIR", tmp_path):
+        with patch("platforms.discord.listener.PROJECTS_DIR", tmp_path):
             result = resolve_project_for_channel("my-project")
             assert result is None
 
     def test_nonexistent_projects_dir(self, tmp_path: Path):
         """Returns None if PROJECTS_DIR doesn't exist."""
         nonexistent = tmp_path / "nonexistent"
-        with patch("platforms.discord.handlers.PROJECTS_DIR", nonexistent):
+        with patch("platforms.discord.listener.PROJECTS_DIR", nonexistent):
             result = resolve_project_for_channel("my-project")
             assert result is None
 
     def test_space_in_folder_name(self, tmp_path: Path):
         """Folder with spaces matches channel with dashes."""
         (tmp_path / "my project").mkdir()
-        with patch("platforms.discord.handlers.PROJECTS_DIR", tmp_path):
+        with patch("platforms.discord.listener.PROJECTS_DIR", tmp_path):
             result = resolve_project_for_channel("my-project")
             assert result == str(tmp_path / "my project")
