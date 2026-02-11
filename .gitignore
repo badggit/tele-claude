@@ -92,3 +92,4 @@ logs/
 # Local utility scripts
 restart.sh
 .bot-sessions.json
+tool_allowlist.json

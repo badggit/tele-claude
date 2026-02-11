@@ -39,6 +39,11 @@ DISCORD_ALLOWED_GUILDS: set[int] = {
 }
 
 
+# --- Claude Model ---
+# Set via CLAUDE_MODEL env var (e.g., claude-opus-4-6-20260205)
+# Defaults to None which lets the SDK pick the default model
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL")
+
 # --- Task Injection API ---
 TASK_API_HOST = os.getenv("TASK_API_HOST", "127.0.0.1")
 TASK_API_PORT = _env_int("TASK_API_PORT", 9111)

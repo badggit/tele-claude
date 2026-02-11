@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Awaitable, Callable, Optional, Protocol, runtime_checkable, Any
 
 from core.session_actor import SessionActor
@@ -122,7 +123,10 @@ class Dispatcher:
             return cwd
         if hasattr(listener, "resolve_cwd"):
             try:
-                return listener.resolve_cwd(trigger)
+                resolved = listener.resolve_cwd(trigger)
+                if resolved:
+                    return resolved
             except Exception:
                 _log.exception("resolve_cwd failed platform=%s", listener.platform)
-        return None
+        # Fallback to home dir for injected tasks
+        return str(Path.home())
