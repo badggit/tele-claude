@@ -253,6 +253,42 @@ class _DiscordClient(discord.Client):
     def __init__(self, listener: DiscordListener, **kwargs) -> None:
         super().__init__(**kwargs)
         self._listener = listener
+        self._task_factory_registered = False
+
+    async def on_ready(self) -> None:
+        _log.info("Discord client ready, guilds=%d", len(self.guilds))
+        await self._register_task_factory()
+
+    async def _register_task_factory(self) -> None:
+        if self._task_factory_registered:
+            return
+        from task_api import register_task_channel_factory
+
+        bot_client = self
+
+        async def create_discord_task_channel(task_name: str) -> int:
+            tasks_channel = None
+            for guild in bot_client.guilds:
+                for channel in guild.text_channels:
+                    if channel.name == "tasks":
+                        tasks_channel = channel
+                        break
+                if tasks_channel:
+                    break
+
+            if not tasks_channel:
+                raise RuntimeError("No #tasks channel found in any authorized guild")
+
+            thread = await tasks_channel.create_thread(
+                name=task_name,
+                type=discord.ChannelType.public_thread,
+            )
+            # Don't create session here - Dispatcher will create it via route_trigger
+            return thread.id
+
+        register_task_channel_factory(create_discord_task_channel)
+        self._task_factory_registered = True
+        _log.info("Discord task factory registered")
 
     async def on_message(self, message: discord.Message) -> None:
         await self._listener._handle_message(message)
