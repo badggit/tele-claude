@@ -54,10 +54,14 @@ class TestSessionStore:
         store.load()
 
         store.update_session_id("key", "sess1", "/cwd", "discord")
-        assert store.get("key").message_count == 1
+        result = store.get("key")
+        assert result is not None
+        assert result.message_count == 1
 
         store.update_session_id("key", "sess1", "/cwd", "discord")
-        assert store.get("key").message_count == 2
+        result = store.get("key")
+        assert result is not None
+        assert result.message_count == 2
 
     def test_update_preserves_created_at(self, tmp_path: Path):
         """Updating session preserves original created_at."""
@@ -65,12 +69,16 @@ class TestSessionStore:
         store.load()
 
         store.update_session_id("key", "sess1", "/cwd", "discord")
-        created_at = store.get("key").created_at
+        result = store.get("key")
+        assert result is not None
+        created_at = result.created_at
 
         time.sleep(0.01)
         store.update_session_id("key", "sess1", "/cwd", "discord")
 
-        assert store.get("key").created_at == created_at
+        result = store.get("key")
+        assert result is not None
+        assert result.created_at == created_at
 
     def test_remove_deletes_session(self, tmp_path: Path):
         """remove() deletes a session."""

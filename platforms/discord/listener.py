@@ -48,7 +48,6 @@ def _is_general_channel(channel: discord.abc.Messageable) -> bool:
 
 class DiscordListener(TransportListener):
     """Listens for Discord messages and converts to Triggers."""
-    """Listens for Discord messages and converts to Triggers."""
 
     platform = "discord"
 
