@@ -45,6 +45,12 @@ HARDCODED_COMMANDS: list[SlashCommand] = [
         prompt="/compact",
         is_contextual=False,
     ),
+    SlashCommand(
+        name="model",
+        description="Show or switch the Claude model",
+        prompt="",  # Handled specially - doesn't go to Claude
+        is_contextual=False,
+    ),
 ]
 
 

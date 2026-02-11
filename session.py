@@ -265,6 +265,7 @@ class ClaudeSession:
     pending_image_path: Optional[str] = None  # Buffered image waiting for prompt
     contextual_commands: list = field(default_factory=list)  # Project-specific slash commands
     sandboxed: bool = False  # If True, only load project settings (no ~/.claude/)
+    model_override: Optional[str] = None  # Per-session model choice (overrides CLAUDE_MODEL)
 
     def get_platform(self) -> Optional[PlatformClient]:
         """Get platform client, creating from bot if needed (backwards compat)."""
@@ -841,6 +842,63 @@ def start_claude_task(thread_id: int, prompt: str, bot: Optional[Bot] = None) ->
     return task
 
 
+# --- /model command ---
+
+_cached_models: Optional[list[dict]] = None
+
+
+async def _get_available_models(session: ClaudeSession) -> list[dict]:
+    """Fetch available models from SDK via get_server_info(), cached globally.
+
+    Only caches non-empty results so transient failures are retried.
+    """
+    global _cached_models
+    if _cached_models is not None:
+        return _cached_models
+
+    models: list[dict] = []
+    try:
+        options = ClaudeAgentOptions(cwd=session.cwd)
+        async with ClaudeSDKClient(options=options) as client:
+            info = await client.get_server_info()
+            models = info.get("models", []) if info else []
+    except Exception as exc:
+        _log.warning("Failed to fetch available models: %s", exc)
+
+    if models:
+        _cached_models = models
+    return models
+
+
+async def handle_model_command(thread_id: int, args: str) -> None:
+    """Handle /model command — list available models or switch model."""
+    session = sessions.get(thread_id)
+    if not session:
+        return
+
+    if not args.strip():
+        # List available models from SDK + known aliases not in get_server_info()
+        models = await _get_available_models(session)
+        current = session.model_override or CLAUDE_MODEL or "default"
+        if not models:
+            await send_message(session, message=TextMessage("Could not fetch available models"))
+            return
+
+        lines = ["**Available models:**\n"]
+        for m in models:
+            value = m.get("value", "")
+            desc = m.get("description", m.get("displayName", ""))
+            marker = "  **← current**" if value == current else ""
+            lines.append(f"`{value}` — {desc}{marker}")
+        lines.append(f"\nAlso accepts: `opus`, `opusplan`, or any full model ID")
+        lines.append(f"Use `/model <name>` to switch")
+        await send_message(session, message=TextMessage("\n".join(lines)))
+    else:
+        # Accept any model name — let the SDK validate on next query
+        model_name = args.strip()
+        session.model_override = model_name
+        await send_message(session, message=TextMessage(f"Model set to `{model_name}` for this session"))
+
 
 def _extract_tool_result_text(block: ToolResultBlock) -> str:
     """Extract displayable text from a ToolResultBlock.
@@ -977,7 +1035,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         # Configure options - use permission handler for interactive tool approval
         def build_options(resume_session_id: Optional[str]) -> ClaudeAgentOptions:
             return ClaudeAgentOptions(
-                model=CLAUDE_MODEL,  # From config/env, None = SDK default
+                model=session.model_override or CLAUDE_MODEL,  # Per-session override > env > SDK default
                 allowed_tools=[],  # Empty - let can_use_tool handle all permissions
                 can_use_tool=create_permission_handler(session),
                 permission_mode="acceptEdits",

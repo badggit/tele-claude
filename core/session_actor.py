@@ -83,9 +83,20 @@ class SessionActor:
             prompt = f"{image_block}\n\n{prompt}" if prompt.strip() else image_block
 
         if prompt.startswith("/"):
+            command_name = prompt.split()[0].lstrip("/").split("@")[0]
+
+            # /model is handled directly — not sent to Claude
+            if command_name == "model":
+                import session as session_module
+
+                thread_id = getattr(self.claude_session, "thread_id", None)
+                if thread_id is not None:
+                    args = prompt[len(prompt.split()[0]):].strip()
+                    await session_module.handle_model_command(thread_id, args)
+                return
+
             from commands import get_command_prompt
 
-            command_name = prompt.split()[0].lstrip("/").split("@")[0]
             contextual = getattr(self.claude_session, "contextual_commands", [])
             command_prompt = get_command_prompt(command_name, contextual)
             if command_prompt is not None:
