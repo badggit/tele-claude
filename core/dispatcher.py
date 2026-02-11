@@ -5,6 +5,7 @@ import logging
 from typing import Awaitable, Callable, Optional, Protocol, runtime_checkable, Any
 
 from core.session_actor import SessionActor
+from core.session_store import session_store
 from core.types import ReplyTarget, Trigger
 
 _log = logging.getLogger("tele-claude.dispatcher.v2")
@@ -44,6 +45,8 @@ class Dispatcher:
         self._sessions: dict[str, SessionActor] = {}
         self._listeners: dict[str, TransportListener] = {}
         self._session_lock = asyncio.Lock()
+        session_store.load()
+        session_store.cleanup_expired()
 
     @property
     def sessions(self) -> dict[str, SessionActor]:
@@ -98,6 +101,13 @@ class Dispatcher:
 
         reply_target = listener.create_reply_target(trigger.reply_context)
         claude_session = await listener.create_session(trigger, cwd)
+        persisted = session_store.get(trigger.session_key)
+        if persisted:
+            if not persisted.cwd:
+                _log.warning("Persisted session missing cwd for %s", trigger.session_key)
+            elif hasattr(claude_session, "session_id"):
+                claude_session.session_id = persisted.claude_session_id
+                _log.info("Restored session_id for %s", trigger.session_key)
         return SessionActor(
             session_key=trigger.session_key,
             platform=trigger.platform,

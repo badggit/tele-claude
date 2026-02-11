@@ -33,6 +33,8 @@ from logger import SessionLogger
 from diff_image import edit_to_image
 from commands import load_contextual_commands, register_commands_for_chat
 from mcp_tools import create_telegram_mcp_server
+from core.session_store import session_store
+from core.types import make_session_key
 
 # Platform abstraction imports
 from platforms import (
@@ -188,6 +190,31 @@ def is_tool_allowed(tool_name: str) -> bool:
     if tool_name in DEFAULT_ALLOWED_TOOLS:
         return True
     return tool_name in load_allowlist()
+
+
+def _session_platform_type(session: "ClaudeSession") -> str:
+    return "discord" if session.chat_id == 0 else "telegram"
+
+
+def _session_key_for_session(session: "ClaudeSession") -> str:
+    if session.chat_id == 0:
+        return make_session_key("discord", channel_id=session.thread_id)
+    return make_session_key("telegram", chat_id=session.chat_id, thread_id=session.thread_id)
+
+
+def _persist_session_id(session: "ClaudeSession", claude_session_id: str) -> None:
+    if not claude_session_id:
+        return
+    session_store.update_session_id(
+        session_key=_session_key_for_session(session),
+        claude_session_id=claude_session_id,
+        cwd=session.cwd,
+        platform=_session_platform_type(session),
+    )
+
+
+def _clear_persisted_session(session: "ClaudeSession") -> None:
+    session_store.remove(_session_key_for_session(session))
 
 
 async def resolve_permission(request_id: str, allowed: bool, always: bool = False, tool_name: Optional[str] = None) -> bool:
@@ -948,24 +975,26 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
         telegram_mcp = create_telegram_mcp_server(session)
 
         # Configure options - use permission handler for interactive tool approval
-        options = ClaudeAgentOptions(
-            allowed_tools=[],  # Empty - let can_use_tool handle all permissions
-            can_use_tool=create_permission_handler(session),
-            permission_mode="acceptEdits",
-            cwd=session.cwd,
-            resume=session.session_id,  # Resume previous conversation if exists
-            system_prompt=system_prompt,
-            setting_sources=["project"] if session.sandboxed else ["user", "project"],  # Sandboxed: project only
-            max_thinking_tokens=10000,  # Enable interleaved thinking between tool calls
-            mcp_servers={
-                "telegram-tools": telegram_mcp,
-            },
-            hooks={
-                "PreCompact": [
-                    HookMatcher(hooks=[create_pre_compact_hook(session)])
-                ]
-            }
-        )
+        def build_options(resume_session_id: Optional[str]) -> ClaudeAgentOptions:
+            return ClaudeAgentOptions(
+                model=None,  # Use SDK default
+                allowed_tools=[],  # Empty - let can_use_tool handle all permissions
+                can_use_tool=create_permission_handler(session),
+                permission_mode="acceptEdits",
+                cwd=session.cwd,
+                resume=resume_session_id,  # Resume previous conversation if exists
+                system_prompt=system_prompt,
+                setting_sources=["project"] if session.sandboxed else ["user", "project"],  # Sandboxed: project only
+                max_thinking_tokens=10000,  # Enable interleaved thinking between tool calls
+                mcp_servers={
+                    "telegram-tools": telegram_mcp,
+                },
+                hooks={
+                    "PreCompact": [
+                        HookMatcher(hooks=[create_pre_compact_hook(session)])
+                    ]
+                }
+            )
 
         # Query Claude using ClaudeSDKClient (required for can_use_tool support)
         # can_use_tool requires streaming mode - wrap prompt in async generator
@@ -981,264 +1010,292 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                 "session_id": session.session_id or "default"
             }
 
-        async with ClaudeSDKClient(options=options) as client:
-            # Store client reference for interrupt support
-            session.client = client
-            _log_session_debug(session, "send_to_claude", "Client ready", thread_id=thread_id)
+        def _looks_like_resume_error(error: Exception) -> bool:
+            message = str(error).lower()
+            return "resume" in message or "session" in message
 
-            await client.query(prompt_stream())
-            _log_session_debug(session, "send_to_claude", "Query sent", thread_id=thread_id)
-            async for message in client.receive_response():
-                # Refresh typing indicator on each message
-                await send_typing_action(session)
-
-                # Log SDK message
-                if session.logger:
-                    session.logger.log_sdk_message(message)
-
-                # Check for interrupt - drain until we get ack or ResultMessage
-                if session.interrupt_event and session.interrupt_event.is_set():
-                    _log_session_debug(
-                        session,
-                        "interrupt",
-                        "Interrupt flag detected while streaming",
-                        thread_id=thread_id,
-                        msg_type=type(message).__name__,
-                    )
-                    # Check for interrupt acknowledgment from SDK
-                    if isinstance(message, UserMessage):
-                        content = message.content
-                        if isinstance(content, str) and "interrupted" in content.lower():
-                            # Display the interrupt message and exit
-                            _log_session_debug(session, "interrupt", "SDK interrupt ack (UserMessage)", thread_id=thread_id)
-                            await send_message(session, message=TextMessage(f"_{content}_"))
+        async def run_stream(options: ClaudeAgentOptions) -> None:
+            nonlocal response_text, response_ref, response_msg_text_len, tool_buffer_name, last_usage, current_model
+            async with ClaudeSDKClient(options=options) as client:
+                # Store client reference for interrupt support
+                session.client = client
+                _log_session_debug(session, "send_to_claude", "Client ready", thread_id=thread_id)
+    
+                await client.query(prompt_stream())
+                _log_session_debug(session, "send_to_claude", "Query sent", thread_id=thread_id)
+                async for message in client.receive_response():
+                    # Refresh typing indicator on each message
+                    await send_typing_action(session)
+    
+                    # Log SDK message
+                    if session.logger:
+                        session.logger.log_sdk_message(message)
+    
+                    # Check for interrupt - drain until we get ack or ResultMessage
+                    if session.interrupt_event and session.interrupt_event.is_set():
+                        _log_session_debug(
+                            session,
+                            "interrupt",
+                            "Interrupt flag detected while streaming",
+                            thread_id=thread_id,
+                            msg_type=type(message).__name__,
+                        )
+                        # Check for interrupt acknowledgment from SDK
+                        if isinstance(message, UserMessage):
+                            content = message.content
+                            if isinstance(content, str) and "interrupted" in content.lower():
+                                # Display the interrupt message and exit
+                                _log_session_debug(session, "interrupt", "SDK interrupt ack (UserMessage)", thread_id=thread_id)
+                                await send_message(session, message=TextMessage(f"_{content}_"))
+                                break
+                        elif isinstance(message, ResultMessage):
+                            # Capture session metadata before exiting
+                            _log_session_debug(session, "interrupt", "ResultMessage while interrupted", thread_id=thread_id)
+                            if message.session_id:
+                                session.session_id = message.session_id
+                                _persist_session_id(session, message.session_id)
+                            if message.usage:
+                                last_usage = message.usage
+                            cost = message.total_cost_usd
+                            duration = message.duration_ms
+                            if session.logger and cost is not None:
+                                session.logger.log_session_stats(cost, duration, last_usage or {})
                             break
+                        # Skip handling other messages while draining
+                        continue
+    
+                    # === Message dispatch — type-correct if/elif chain ===
+    
+                    # Branch 1: SystemMessage
+                    if isinstance(message, SystemMessage):
+                        if message.subtype == "init":
+                            sid = message.data.get("session_id")
+                            if sid and not session.session_id:
+                                session.session_id = sid
+                                _persist_session_id(session, sid)
+                        if session.logger:
+                            session.logger.log_debug("send_to_claude", f"SystemMessage: {message.subtype}")
+                        continue
+    
+                    # Branch 2: AssistantMessage (content is ALWAYS list[ContentBlock])
+                    elif isinstance(message, AssistantMessage):
+                        current_model = message.model
+    
+                        # API errors — display before subagent check (user should see rate limits from subagents)
+                        if message.error:
+                            error_label = message.error.replace("_", " ").title()
+                            await send_message(session, message=TextMessage(f"⚠️ API error: {error_label}"))
+    
+                        is_subagent = message.parent_tool_use_id is not None
+    
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                if not block.text.strip() or block.text.strip() == "(no content)":
+                                    continue
+    
+                                if is_subagent:
+                                    await flush_tool_buffer()
+                                    await send_message(session, message=TextMessage(md_blockquote(block.text)))
+                                else:
+                                    await flush_tool_buffer()
+                                    response_text += block.text
+                                    response_ref, response_msg_text_len = await send_or_edit_response(
+                                        session, existing_ref=response_ref, text=response_text,
+                                        msg_text_len=response_msg_text_len
+                                    )
+    
+                            elif isinstance(block, ToolUseBlock):
+                                if is_subagent:
+                                    if session.logger:
+                                        session.logger.log_debug(
+                                            "send_to_claude",
+                                            f"Subagent tool use: {block.name} (parent={message.parent_tool_use_id})"
+                                        )
+                                else:
+                                    if response_text.strip():
+                                        response_ref, response_msg_text_len = await send_or_edit_response(
+                                            session, existing_ref=response_ref, text=response_text,
+                                            msg_text_len=response_msg_text_len
+                                        )
+                                        response_ref = None
+                                        response_text = ""
+                                        response_msg_text_len = 0
+    
+                                    tool_name = block.name
+                                    tool_input = block.input
+    
+                                    if tool_buffer_name and tool_buffer_name != tool_name:
+                                        await flush_tool_buffer()
+    
+                                    tool_buffer.append((tool_name, tool_input))
+                                    tool_buffer_name = tool_name
+                                    await update_tool_buffer_message()
+    
+                                    if tool_name == "Edit" and "old_string" in tool_input and "new_string" in tool_input:
+                                        file_path = tool_input.get("file_path", "file")
+                                        old_string = tool_input["old_string"]
+                                        new_string = tool_input["new_string"]
+                                        if len(old_string) + len(new_string) <= MAX_DIFF_IMAGE_INPUT_CHARS:
+                                            img_buffer = await asyncio.to_thread(
+                                                edit_to_image,
+                                                file_path=file_path,
+                                                old_string=old_string,
+                                                new_string=new_string
+                                            )
+                                        else:
+                                            img_buffer = None
+                                        if img_buffer:
+                                            filename = file_path.split("/")[-1] if "/" in file_path else file_path
+                                            diff_images.append((img_buffer, filename))
+    
+                            elif isinstance(block, ThinkingBlock):
+                                if not is_subagent:
+                                    await flush_tool_buffer()
+                                    if response_text.strip():
+                                        response_ref, response_msg_text_len = await send_or_edit_response(
+                                            session, existing_ref=response_ref, text=response_text,
+                                            msg_text_len=response_msg_text_len
+                                        )
+                                        response_ref = None
+                                        response_text = ""
+                                        response_msg_text_len = 0
+    
+                                    thinking_text = block.thinking
+                                    if thinking_text:
+                                        await send_message(session, message=ThinkingMessage(thinking_text))
+    
+                            elif isinstance(block, ToolResultBlock):
+                                # Only display error results — successful tool output is noise
+                                # (Claude incorporates relevant info in its text response)
+                                if block.is_error:
+                                    text = _extract_tool_result_text(block)
+                                    if text:
+                                        await flush_tool_buffer()
+                                        output = format_tool_output(text)
+                                        if output:
+                                            if is_subagent:
+                                                await send_message(session, message=TextMessage(md_blockquote(md_escape(output))))
+                                            else:
+                                                await send_message(session, message=TextMessage(md_code_block(output)))
+    
+                    # Branch 3: UserMessage (content is str | list[ContentBlock])
+                    elif isinstance(message, UserMessage):
+                        is_subagent = message.parent_tool_use_id is not None
+                        content = message.content
+    
+                        if isinstance(content, str):
+                            # Tool result strings are noisy — only refresh typing indicator
+                            if content:
+                                await send_typing_action(session)
+    
+                        elif isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, ToolResultBlock):
+                                    # Only display error results
+                                    if block.is_error:
+                                        await flush_tool_buffer()
+                                        text = _extract_tool_result_text(block)
+                                        output = format_tool_output(text) if text else None
+                                        if output:
+                                            if is_subagent:
+                                                await send_message(session, message=TextMessage(md_blockquote(md_escape(output))))
+                                            else:
+                                                await send_message(session, message=TextMessage(md_code_block(output)))
+                                    await send_typing_action(session)
+    
+                                elif isinstance(block, TextBlock):
+                                    # Suppress tool result text output (noisy, non-actionable)
+                                    await send_typing_action(session)
+    
+                    # Branch 4: ResultMessage
                     elif isinstance(message, ResultMessage):
-                        # Capture session metadata before exiting
-                        _log_session_debug(session, "interrupt", "ResultMessage while interrupted", thread_id=thread_id)
                         if message.session_id:
                             session.session_id = message.session_id
+                            _persist_session_id(session, message.session_id)
                         if message.usage:
                             last_usage = message.usage
+    
+                        # Surface session-level errors
+                        if message.is_error:
+                            error_text = message.result or "Session ended with an error"
+                            await send_message(session, message=TextMessage(f"⚠️ {error_text}"))
+    
                         cost = message.total_cost_usd
                         duration = message.duration_ms
                         if session.logger and cost is not None:
                             session.logger.log_session_stats(cost, duration, last_usage or {})
-                        break
-                    # Skip handling other messages while draining
-                    continue
-
-                # === Message dispatch — type-correct if/elif chain ===
-
-                # Branch 1: SystemMessage
-                if isinstance(message, SystemMessage):
-                    if message.subtype == "init":
-                        sid = message.data.get("session_id")
-                        if sid and not session.session_id:
-                            session.session_id = sid
-                    if session.logger:
-                        session.logger.log_debug("send_to_claude", f"SystemMessage: {message.subtype}")
-                    continue
-
-                # Branch 2: AssistantMessage (content is ALWAYS list[ContentBlock])
-                elif isinstance(message, AssistantMessage):
-                    current_model = message.model
-
-                    # API errors — display before subagent check (user should see rate limits from subagents)
-                    if message.error:
-                        error_label = message.error.replace("_", " ").title()
-                        await send_message(session, message=TextMessage(f"⚠️ API error: {error_label}"))
-
-                    is_subagent = message.parent_tool_use_id is not None
-
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            if not block.text.strip() or block.text.strip() == "(no content)":
-                                continue
-
-                            if is_subagent:
-                                await flush_tool_buffer()
-                                await send_message(session, message=TextMessage(md_blockquote(block.text)))
-                            else:
-                                await flush_tool_buffer()
-                                response_text += block.text
-                                response_ref, response_msg_text_len = await send_or_edit_response(
-                                    session, existing_ref=response_ref, text=response_text,
-                                    msg_text_len=response_msg_text_len
-                                )
-
-                        elif isinstance(block, ToolUseBlock):
-                            if is_subagent:
-                                if session.logger:
-                                    session.logger.log_debug(
-                                        "send_to_claude",
-                                        f"Subagent tool use: {block.name} (parent={message.parent_tool_use_id})"
-                                    )
-                            else:
-                                if response_text.strip():
-                                    response_ref, response_msg_text_len = await send_or_edit_response(
-                                        session, existing_ref=response_ref, text=response_text,
-                                        msg_text_len=response_msg_text_len
-                                    )
-                                    response_ref = None
-                                    response_text = ""
-                                    response_msg_text_len = 0
-
-                                tool_name = block.name
-                                tool_input = block.input
-
-                                if tool_buffer_name and tool_buffer_name != tool_name:
-                                    await flush_tool_buffer()
-
-                                tool_buffer.append((tool_name, tool_input))
-                                tool_buffer_name = tool_name
-                                await update_tool_buffer_message()
-
-                                if tool_name == "Edit" and "old_string" in tool_input and "new_string" in tool_input:
-                                    file_path = tool_input.get("file_path", "file")
-                                    old_string = tool_input["old_string"]
-                                    new_string = tool_input["new_string"]
-                                    if len(old_string) + len(new_string) <= MAX_DIFF_IMAGE_INPUT_CHARS:
-                                        img_buffer = await asyncio.to_thread(
-                                            edit_to_image,
-                                            file_path=file_path,
-                                            old_string=old_string,
-                                            new_string=new_string
-                                        )
-                                    else:
-                                        img_buffer = None
-                                    if img_buffer:
-                                        filename = file_path.split("/")[-1] if "/" in file_path else file_path
-                                        diff_images.append((img_buffer, filename))
-
-                        elif isinstance(block, ThinkingBlock):
-                            if not is_subagent:
-                                await flush_tool_buffer()
-                                if response_text.strip():
-                                    response_ref, response_msg_text_len = await send_or_edit_response(
-                                        session, existing_ref=response_ref, text=response_text,
-                                        msg_text_len=response_msg_text_len
-                                    )
-                                    response_ref = None
-                                    response_text = ""
-                                    response_msg_text_len = 0
-
-                                thinking_text = block.thinking
-                                if thinking_text:
-                                    await send_message(session, message=ThinkingMessage(thinking_text))
-
-                        elif isinstance(block, ToolResultBlock):
-                            # Only display error results — successful tool output is noise
-                            # (Claude incorporates relevant info in its text response)
-                            if block.is_error:
-                                text = _extract_tool_result_text(block)
-                                if text:
-                                    await flush_tool_buffer()
-                                    output = format_tool_output(text)
-                                    if output:
-                                        if is_subagent:
-                                            await send_message(session, message=TextMessage(md_blockquote(md_escape(output))))
-                                        else:
-                                            await send_message(session, message=TextMessage(md_code_block(output)))
-
-                # Branch 3: UserMessage (content is str | list[ContentBlock])
-                elif isinstance(message, UserMessage):
-                    is_subagent = message.parent_tool_use_id is not None
-                    content = message.content
-
-                    if isinstance(content, str):
-                        # Tool result strings are noisy — only refresh typing indicator
-                        if content:
-                            await send_typing_action(session)
-
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, ToolResultBlock):
-                                # Only display error results
-                                if block.is_error:
-                                    await flush_tool_buffer()
-                                    text = _extract_tool_result_text(block)
-                                    output = format_tool_output(text) if text else None
-                                    if output:
-                                        if is_subagent:
-                                            await send_message(session, message=TextMessage(md_blockquote(md_escape(output))))
-                                        else:
-                                            await send_message(session, message=TextMessage(md_code_block(output)))
-                                await send_typing_action(session)
-
-                            elif isinstance(block, TextBlock):
-                                # Suppress tool result text output (noisy, non-actionable)
-                                await send_typing_action(session)
-
-                # Branch 4: ResultMessage
-                elif isinstance(message, ResultMessage):
-                    if message.session_id:
-                        session.session_id = message.session_id
-                    if message.usage:
-                        last_usage = message.usage
-
-                    # Surface session-level errors
-                    if message.is_error:
-                        error_text = message.result or "Session ended with an error"
-                        await send_message(session, message=TextMessage(f"⚠️ {error_text}"))
-
-                    cost = message.total_cost_usd
-                    duration = message.duration_ms
-                    if session.logger and cost is not None:
-                        session.logger.log_session_stats(cost, duration, last_usage or {})
-
-                # Branch 5: Catch-all (StreamEvent or unknown)
-                else:
-                    if session.logger:
-                        session.logger.log_debug(
-                            "send_to_claude",
-                            f"Unhandled message type: {type(message).__name__}"
-                        )
-
-            # Clear client reference IMMEDIATELY after loop exits.
-            # This prevents interrupt_session from trying to interrupt a finished SDK,
-            # and ensures the task won't hang on SDK cleanup if a new message arrives.
-            session.client = None
-            _log_session_debug(session, "send_to_claude", "Stream loop ended", thread_id=thread_id)
-
-            # Flush any remaining buffers (after loop)
-            await flush_tool_buffer()
-            if response_text.strip() and response_ref is None:
-                await send_message(session, message=TextMessage(response_text))
-
-            # Send diff images as media group (gallery)
-            if diff_images:
-                await send_diff_images_gallery(session, images=diff_images)
-
-            # Calculate and store context remaining
-            if last_usage:
-                context_remaining = calculate_context_remaining(last_usage, current_model or "default")
-                if context_remaining is not None:
-                    session.last_context_percent = context_remaining
-
-                    # Warn user if context is running low - append to last text response
-                    if context_remaining < CONTEXT_WARNING_THRESHOLD:
+    
+                    # Branch 5: Catch-all (StreamEvent or unknown)
+                    else:
                         if session.logger:
-                            session.logger._write_log(f"CONTEXT WARNING: {context_remaining:.1f}% remaining")
-
-                        warning = f"\n\n⚠️ {context_remaining:.0f}% context remaining"
-                        max_len = platform.max_message_length
-
-                        # Only append to text response message (not tool messages)
-                        if response_ref and response_ref.platform_data and response_msg_text_len > 0:
-                            # Check if warning fits in current message
-                            if response_msg_text_len + len(warning) <= max_len:
-                                # Get the text currently in the message and append warning
-                                current_msg_text = response_text[-response_msg_text_len:] if len(response_text) > response_msg_text_len else response_text
-                                warning_text = current_msg_text + warning
-                                try:
-                                    await platform.edit_message(response_ref, TextMessage(warning_text))
-                                except Exception:
-                                    # Edit failed, send as separate message
+                            session.logger.log_debug(
+                                "send_to_claude",
+                                f"Unhandled message type: {type(message).__name__}"
+                            )
+    
+                # Clear client reference IMMEDIATELY after loop exits.
+                # This prevents interrupt_session from trying to interrupt a finished SDK,
+                # and ensures the task won't hang on SDK cleanup if a new message arrives.
+                session.client = None
+                _log_session_debug(session, "send_to_claude", "Stream loop ended", thread_id=thread_id)
+    
+                # Flush any remaining buffers (after loop)
+                await flush_tool_buffer()
+                if response_text.strip() and response_ref is None:
+                    await send_message(session, message=TextMessage(response_text))
+    
+                # Send diff images as media group (gallery)
+                if diff_images:
+                    await send_diff_images_gallery(session, images=diff_images)
+    
+                # Calculate and store context remaining
+                if last_usage:
+                    context_remaining = calculate_context_remaining(last_usage, current_model or "default")
+                    if context_remaining is not None:
+                        session.last_context_percent = context_remaining
+    
+                        # Warn user if context is running low - append to last text response
+                        if context_remaining < CONTEXT_WARNING_THRESHOLD:
+                            if session.logger:
+                                session.logger._write_log(f"CONTEXT WARNING: {context_remaining:.1f}% remaining")
+    
+                            warning = f"\n\n⚠️ {context_remaining:.0f}% context remaining"
+                            max_len = platform.max_message_length
+    
+                            # Only append to text response message (not tool messages)
+                            if response_ref and response_ref.platform_data and response_msg_text_len > 0:
+                                # Check if warning fits in current message
+                                if response_msg_text_len + len(warning) <= max_len:
+                                    # Get the text currently in the message and append warning
+                                    current_msg_text = response_text[-response_msg_text_len:] if len(response_text) > response_msg_text_len else response_text
+                                    warning_text = current_msg_text + warning
+                                    try:
+                                        await platform.edit_message(response_ref, TextMessage(warning_text))
+                                    except Exception:
+                                        # Edit failed, send as separate message
+                                        await send_message(session, message=TextMessage(f"⚠️ {context_remaining:.0f}% context remaining"))
+                                else:
+                                    # Warning doesn't fit, send separately
                                     await send_message(session, message=TextMessage(f"⚠️ {context_remaining:.0f}% context remaining"))
-                            else:
-                                # Warning doesn't fit, send separately
-                                await send_message(session, message=TextMessage(f"⚠️ {context_remaining:.0f}% context remaining"))
+    
+        try:
+            resume_id = session.session_id
+            _log.info("Starting stream with resume=%s for thread_id=%s", resume_id[:8] + "..." if resume_id else None, thread_id)
+            await run_stream(build_options(resume_id))
+        except Exception as e:
+            if session.session_id and _looks_like_resume_error(e):
+                session_key = _session_key_for_session(session)
+                _log.warning(
+                    "Resume failed for %s; clearing stored session_id and retrying without resume: %s",
+                    session_key,
+                    e,
+                )
+                session.session_id = None
+                _clear_persisted_session(session)
+                session.client = None
+                await run_stream(build_options(None))
+            else:
+                raise
 
         _log_session_debug(
             session,
