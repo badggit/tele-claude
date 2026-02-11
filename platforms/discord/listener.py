@@ -9,17 +9,45 @@ from typing import Any, Awaitable, Callable, Optional
 
 import discord
 
-from config import DISCORD_ALLOWED_GUILDS
+from config import DISCORD_ALLOWED_GUILDS, PROJECTS_DIR
 from core.dispatcher import TransportListener
 from core.types import Trigger, make_session_key
 from utils import ensure_image_within_limits
 from .reply_target import DiscordReplyTarget
-from .handlers import resolve_project_for_channel, _is_general_channel
 
 _log = logging.getLogger("tele-claude.discord.listener")
 
 
+def _normalize_name(name: str) -> str:
+    """Normalize a name for matching: lowercase, replace _ and spaces with -."""
+    return name.lower().replace("_", "-").replace(" ", "-")
+
+
+def resolve_project_for_channel(channel_name: str) -> Optional[str]:
+    """Resolve a project directory by matching channel name to a PROJECTS_DIR subfolder."""
+    if not PROJECTS_DIR.exists():
+        return None
+    normalized = _normalize_name(channel_name)
+    for d in PROJECTS_DIR.iterdir():
+        if d.is_dir() and not d.name.startswith(".") and _normalize_name(d.name) == normalized:
+            return str(d)
+    return None
+
+
+def _is_general_channel(channel: discord.abc.Messageable) -> bool:
+    """Check if channel is #general (ambient channel for home folder sessions)."""
+    if isinstance(channel, discord.Thread):
+        parent = channel.parent
+        if parent:
+            return parent.name.lower() == "general"
+        return False
+    if isinstance(channel, discord.TextChannel):
+        return channel.name.lower() == "general"
+    return False
+
+
 class DiscordListener(TransportListener):
+    """Listens for Discord messages and converts to Triggers."""
     """Listens for Discord messages and converts to Triggers."""
 
     platform = "discord"
@@ -176,9 +204,50 @@ class DiscordListener(TransportListener):
         return images
 
     async def _handle_interaction(self, interaction: discord.Interaction) -> None:
-        from platforms.discord.handlers import handle_interaction
+        """Handle button interactions (permission responses)."""
+        from session import sessions, resolve_permission
 
-        await handle_interaction(interaction)
+        if not interaction.data:
+            return
+
+        custom_id = interaction.data.get("custom_id", "")
+
+        # Handle permission responses: "perm:<action>:<request_id>:<tool_name>"
+        if custom_id.startswith("perm:"):
+            parts = custom_id.split(":", 3)
+            if len(parts) != 4:
+                await interaction.response.send_message("Invalid permission callback", ephemeral=True)
+                return
+
+            _, action, request_id, tool_name = parts
+
+            channel = interaction.channel
+            session_id = channel.id if channel else None
+            session = sessions.get(session_id) if session_id else None
+
+            if session and session.logger:
+                session.logger.log_permission_callback(request_id, action, tool_name)
+
+            if action == "allow":
+                success = await resolve_permission(request_id, allowed=True, always=False, tool_name=tool_name)
+                if success:
+                    await interaction.response.edit_message(content=f"✅ Allowed `{tool_name}` (one-time)", view=None)
+                else:
+                    await interaction.response.edit_message(content="⚠️ Permission request expired", view=None)
+
+            elif action == "deny":
+                success = await resolve_permission(request_id, allowed=False, always=False, tool_name=tool_name)
+                if success:
+                    await interaction.response.edit_message(content=f"❌ Denied `{tool_name}`", view=None)
+                else:
+                    await interaction.response.edit_message(content="⚠️ Permission request expired", view=None)
+
+            elif action == "always":
+                success = await resolve_permission(request_id, allowed=True, always=True, tool_name=tool_name)
+                if success:
+                    await interaction.response.edit_message(content=f"✅ Always allowed `{tool_name}`", view=None)
+                else:
+                    await interaction.response.edit_message(content="⚠️ Permission request expired", view=None)
 
 
 class _DiscordClient(discord.Client):
