@@ -95,6 +95,16 @@ class SessionActor:
                     await session_module.handle_model_command(thread_id, args)
                 return
 
+            # /watchdog is handled directly — not sent to Claude
+            if command_name == "watchdog":
+                import session as session_module
+
+                thread_id = getattr(self.claude_session, "thread_id", None)
+                if thread_id is not None:
+                    args = prompt[len(prompt.split()[0]):].strip()
+                    await session_module.handle_watchdog_command(thread_id, args)
+                return
+
             from commands import get_command_prompt
 
             contextual = getattr(self.claude_session, "contextual_commands", [])
@@ -125,6 +135,12 @@ class SessionActor:
 
     async def _cancel_current_task(self) -> None:
         """Cancel current task and wait for cleanup."""
+        # Cancel watchdog retry if pending
+        watchdog_task = getattr(self.claude_session, "_watchdog_task", None)
+        if watchdog_task and not watchdog_task.done():
+            watchdog_task.cancel()
+            self.claude_session._watchdog_task = None
+
         if self.current_task:
             interrupted = False
             try:
