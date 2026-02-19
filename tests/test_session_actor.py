@@ -175,3 +175,88 @@ async def test_new_trigger_cancels_pending_watchdog_retry(monkeypatch: pytest.Mo
         actor._run_loop_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await actor._run_loop_task
+
+
+@pytest.mark.asyncio
+async def test_watchdog_trigger_does_not_interrupt_active_user_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    import session as session_module
+
+    prompts: list[str] = []
+    blocker = asyncio.Event()
+
+    def fake_start(thread_id: int, prompt: str, bot) -> asyncio.Task:
+        prompts.append(prompt)
+        if prompt == "manual":
+            return asyncio.create_task(blocker.wait())
+        return asyncio.create_task(asyncio.sleep(0))
+
+    async def fake_interrupt(thread_id: int) -> bool:
+        return True
+
+    interrupt_spy = MagicMock(side_effect=fake_interrupt)
+    monkeypatch.setattr(session_module, "start_claude_task", fake_start)
+    monkeypatch.setattr(session_module, "interrupt_session", interrupt_spy)
+
+    actor = SessionActor(
+        session_key="telegram:5",
+        platform="telegram",
+        cwd="/tmp",
+        reply_target=MagicMock(),
+        claude_session=MagicMock(thread_id=5, bot=None, pending_image_path=None),
+    )
+
+    await actor.start()
+    await actor.enqueue(Trigger(platform="telegram", session_key="telegram:5", prompt="manual", source="user"))
+    await _wait_for_condition(lambda: actor.current_task is not None)
+    await actor.enqueue(Trigger(platform="telegram", session_key="telegram:5", prompt="Continue", source="watchdog"))
+    await _wait_for_condition(lambda: actor._mailbox.empty())
+
+    assert actor.stats.interrupt_count == 0
+    assert prompts == ["manual"]
+    assert interrupt_spy.call_count == 0
+
+    blocker.set()
+    if actor.current_task:
+        await actor.current_task
+    actor.active = False
+    if actor._run_loop_task:
+        actor._run_loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await actor._run_loop_task
+
+
+@pytest.mark.asyncio
+async def test_watchdog_trigger_is_skipped_when_user_trigger_is_queued(monkeypatch: pytest.MonkeyPatch) -> None:
+    import session as session_module
+
+    prompts: list[str] = []
+
+    def fake_start(thread_id: int, prompt: str, bot) -> asyncio.Task:
+        prompts.append(prompt)
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(session_module, "start_claude_task", fake_start)
+
+    actor = SessionActor(
+        session_key="telegram:6",
+        platform="telegram",
+        cwd="/tmp",
+        reply_target=MagicMock(),
+        claude_session=MagicMock(thread_id=6, bot=None, pending_image_path=None),
+    )
+
+    await actor.enqueue(Trigger(platform="telegram", session_key="telegram:6", prompt="Continue", source="watchdog"))
+    await actor.enqueue(Trigger(platform="telegram", session_key="telegram:6", prompt="manual", source="user"))
+    await actor.start()
+
+    await _wait_for_condition(lambda: actor._mailbox.empty())
+    await _wait_for_condition(lambda: len(prompts) == 1)
+
+    assert prompts == ["manual"]
+    assert actor.stats.interrupt_count == 0
+
+    actor.active = False
+    if actor._run_loop_task:
+        actor._run_loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await actor._run_loop_task

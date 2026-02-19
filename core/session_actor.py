@@ -24,6 +24,7 @@ class SessionActor:
     _mailbox: asyncio.Queue[Trigger] = field(default_factory=asyncio.Queue)
     _run_loop_task: Optional[asyncio.Task] = None
     _generation_id: int = 0
+    _queued_non_watchdog: int = 0
 
     active: bool = True
     current_task: Optional[asyncio.Task] = None
@@ -39,6 +40,8 @@ class SessionActor:
 
     async def enqueue(self, trigger: Trigger) -> None:
         """Add trigger to mailbox."""
+        if trigger.source != "watchdog":
+            self._queued_non_watchdog += 1
         await self._mailbox.put(trigger)
 
     async def _run_loop(self) -> None:
@@ -49,8 +52,18 @@ class SessionActor:
             except asyncio.CancelledError:
                 break
 
+            if trigger.source != "watchdog" and self._queued_non_watchdog > 0:
+                self._queued_non_watchdog -= 1
+
             try:
                 self._cancel_watchdog_retry()
+                if trigger.source == "watchdog":
+                    if self.current_task and not self.current_task.done():
+                        _log.debug("Skipping watchdog trigger while task is active session_key=%s", self.session_key)
+                        continue
+                    if self._queued_non_watchdog > 0:
+                        _log.debug("Skipping watchdog trigger due queued user input session_key=%s", self.session_key)
+                        continue
                 if self.current_task and not self.current_task.done():
                     self._generation_id += 1
                     self.stats.interrupt_count += 1
