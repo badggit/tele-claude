@@ -131,3 +131,47 @@ async def test_cancel_current_task_cancels_pending_permission(monkeypatch: pytes
     assert pending.cancelled() is True
     assert actor.pending_permission is None
     assert actor.current_task is None
+
+
+@pytest.mark.asyncio
+async def test_new_trigger_cancels_pending_watchdog_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    import session as session_module
+
+    def fake_start(thread_id: int, prompt: str, bot) -> asyncio.Task:
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(session_module, "start_claude_task", fake_start)
+
+    claude_session = MagicMock(
+        thread_id=4,
+        bot=None,
+        pending_image_path=None,
+        actor_enqueue=None,
+    )
+    watchdog_task = asyncio.create_task(asyncio.sleep(10))
+    claude_session._watchdog_task = watchdog_task
+
+    actor = SessionActor(
+        session_key="telegram:4",
+        platform="telegram",
+        cwd="/tmp",
+        reply_target=MagicMock(),
+        claude_session=claude_session,
+    )
+
+    await actor.start()
+    await actor.enqueue(Trigger(platform="telegram", session_key="telegram:4", prompt="next"))
+
+    await _wait_for_condition(lambda: actor.current_task is not None)
+    if actor.current_task:
+        await actor.current_task
+
+    await _wait_for_condition(lambda: watchdog_task.done())
+    assert watchdog_task.cancelled() is True
+    assert claude_session._watchdog_task is None
+
+    actor.active = False
+    if actor._run_loop_task:
+        actor._run_loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await actor._run_loop_task

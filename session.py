@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Any, Union
+from typing import Optional, Any, Union, Callable, Awaitable
 
 import mistune
 from telegram import Bot, Message, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
@@ -34,7 +34,7 @@ from diff_image import edit_to_image
 from commands import load_contextual_commands, register_commands_for_chat
 from mcp_tools import create_telegram_mcp_server
 from core.session_store import session_store
-from core.types import make_session_key
+from core.types import make_session_key, Trigger
 
 # Platform abstraction imports
 from platforms import (
@@ -268,6 +268,7 @@ class ClaudeSession:
     model_override: Optional[str] = None  # Per-session model choice (overrides CLAUDE_MODEL)
     watchdog_enabled: bool = False  # Auto-retry on token limit
     _watchdog_task: Optional[asyncio.Task] = None  # Scheduled retry task
+    actor_enqueue: Optional[Callable[[Trigger], Awaitable[None]]] = None  # Actor queue hook
 
     def get_platform(self) -> Optional[PlatformClient]:
         """Get platform client, creating from bot if needed (backwards compat)."""
@@ -906,16 +907,34 @@ def _parse_limit_reset(text: str) -> Optional[float]:
 
 async def _watchdog_retry(session: ClaudeSession, thread_id: int, delay: float) -> None:
     """Wait for delay, then send 'Continue' to Claude."""
+    watchdog_task = asyncio.current_task()
     try:
         await asyncio.sleep(delay)
         if not session.watchdog_enabled:
             return  # watchdog was turned off while waiting
         if session.current_task and not session.current_task.done():
             return  # user already sent something, skip
+
+        enqueue = session.actor_enqueue
+        if enqueue is None:
+            _log.warning("Watchdog retry skipped: actor enqueue unavailable for thread_id=%s", thread_id)
+            return
+
+        await enqueue(
+            Trigger(
+                platform=_session_platform_type(session),
+                session_key=_session_key_for_session(session),
+                prompt="Continue",
+                reply_context={"cwd": session.cwd},
+                source="watchdog",
+            )
+        )
         await send_message(session, message=TextMessage("🐕 Watchdog: sending Continue"))
-        start_claude_task(thread_id, "Continue")
     except asyncio.CancelledError:
         pass  # watchdog turned off or session closed
+    finally:
+        if session._watchdog_task is watchdog_task:
+            session._watchdog_task = None
 
 
 async def handle_watchdog_command(thread_id: int, args: str) -> None:
@@ -1442,6 +1461,8 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
             delay += 60  # buffer after reset
             minutes = int(delay // 60)
             await send_message(session, message=TextMessage(f"🐕 Watchdog: limit hit, retry in {minutes} min"))
+            if session._watchdog_task and not session._watchdog_task.done():
+                session._watchdog_task.cancel()
             session._watchdog_task = asyncio.create_task(_watchdog_retry(session, thread_id, delay))
 
         _log_session_debug(

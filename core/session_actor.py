@@ -32,6 +32,8 @@ class SessionActor:
 
     async def start(self) -> None:
         """Start the actor's run loop."""
+        if hasattr(self.claude_session, "actor_enqueue"):
+            self.claude_session.actor_enqueue = self.enqueue
         if self._run_loop_task is None or self._run_loop_task.done():
             self._run_loop_task = asyncio.create_task(self._run_loop())
 
@@ -48,6 +50,7 @@ class SessionActor:
                 break
 
             try:
+                self._cancel_watchdog_retry()
                 if self.current_task and not self.current_task.done():
                     self._generation_id += 1
                     self.stats.interrupt_count += 1
@@ -135,11 +138,7 @@ class SessionActor:
 
     async def _cancel_current_task(self) -> None:
         """Cancel current task and wait for cleanup."""
-        # Cancel watchdog retry if pending
-        watchdog_task = getattr(self.claude_session, "_watchdog_task", None)
-        if watchdog_task and not watchdog_task.done():
-            watchdog_task.cancel()
-            self.claude_session._watchdog_task = None
+        self._cancel_watchdog_retry()
 
         if self.current_task:
             interrupted = False
@@ -163,6 +162,14 @@ class SessionActor:
         if self.pending_permission and not self.pending_permission.done():
             self.pending_permission.cancel()
         self.pending_permission = None
+
+    def _cancel_watchdog_retry(self) -> None:
+        """Cancel a pending watchdog retry for this session, if any."""
+        watchdog_task = getattr(self.claude_session, "_watchdog_task", None)
+        if watchdog_task and not watchdog_task.done():
+            watchdog_task.cancel()
+        if hasattr(self.claude_session, "_watchdog_task"):
+            self.claude_session._watchdog_task = None
 
     async def resolve_permission(self, allowed: bool, always: bool) -> None:
         """Resolve a pending permission request."""
